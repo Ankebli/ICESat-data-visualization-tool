@@ -1,0 +1,17 @@
+# ICESat 光子剖面查看器 —— 依赖
+# 推荐直接使用已有的 conda 环境 waterenv (已包含全部依赖):
+#   C:\Users\ASUS\miniconda3\envs\waterenv\python.exe main.py
+# 如需在新环境安装:
+#   python -m pip install -r requirements.txt
+
+numpy>=1.24
+matplotlib>=3.6
+Pillow>=9.0
+requests>=2.28
+h5py>=3.8
+
+# ---- 可选但推荐 (缺失时程序自动降级) ----
+pyproj>=3.4     # WGS84 椭球大地线计算 (缺失则用球面近似)
+scipy>=1.9      # KD 树加速覆盖区判定
+pandas>=1.5     # CSV/TXT 数据读取
+laspy>=2.4      # 仅读取 .laz 压缩点云时需要 (.las 由内置解析器读取)

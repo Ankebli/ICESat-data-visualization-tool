@@ -1,0 +1,24 @@
+{
+  "_说明": "本文件为配置示例。程序首次保存设置时会自动在项目根目录生成 config.json（字段与下面一致）。",
+  "_天地图密钥": "到 https://console.tianditu.gov.cn/api/key 免费申请；也可用环境变量 TIANDITU_TK（优先级更高）",
+
+  "tianditu_token": "",
+  "provider": "tianditu_img",
+
+  "corridor_half_width_m": 25.0,
+  "elev_kind": "椭球高",
+  "conf_mode": "全部",
+  "conf_channel": "自动",
+  "remove_afterpulse": false,
+
+  "point_size": 2.0,
+  "show_surface": true,
+  "bin_size_m": 20.0,
+  "hist_bins": 200,
+  "show_tracks": true,
+
+  "max_plot_points": 600000,
+  "coverage_tolerance_m": 2000.0,
+  "last_dir": "",
+  "recent_files": []
+}
