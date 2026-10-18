@@ -153,6 +153,10 @@ def main() -> int:
     app.map.clear_pick()
     app.pick_var.set(True)
     app._toggle_pick_mode()
+    # 用"全部 + 自动通道"保证走廊全长都有光子 (否则可能被高置信/特定通道筛掉)
+    app.conf_var.set("全部")
+    app.channel_var.set("自动")
+    app.afterpulse_var.set(False)
     widget = app.map.canvas.get_tk_widget()
     pump(app, 0.3)
 
@@ -160,7 +164,17 @@ def main() -> int:
         """经纬度 -> Tk 控件像素 (左上角原点)."""
         x, y = geo.lonlat_to_mercator(lon, lat)
         dx, dy = app.map.ax.transData.transform((float(x), float(y)))
-        return int(round(dx)), int(round(widget.winfo_height() - dy))
+        return int(round(dx)), int(round(app.map.figure.bbox.height - dy))
+
+    def send(widget_, ev, x, y, **kw):
+        """合成鼠标事件。
+
+        必须带正确的 root 坐标: matplotlib 的 Tk 后端会用
+        ``winfo_containing(x_root, y_root)`` 过滤事件, 缺了会被丢弃。
+        """
+        widget_.event_generate(ev, x=int(x), y=int(y),
+                               rootx=int(widget_.winfo_rootx() + x),
+                               rooty=int(widget_.winfo_rooty() + y), **kw)
 
     # 取真实轨迹上的两点, 保证廊道里一定有光子
     _label, lon_arr, lat_arr, _color = ds.track_full_arrays()[0]
@@ -172,15 +186,19 @@ def main() -> int:
                            min(p0[1], p1[1]) - 0.01, max(p0[1], p1[1]) + 0.01)
     pump(app, 1.5)
 
-    xy0, xy1 = to_widget_xy(*p0), to_widget_xy(*p1)
-    # 故意偏离轨道 ~3 像素, 检验"自动吸附"是否把点拉回轨道
-    off = 3
-    clicks = [(xy0[0] + off, xy0[1] + off), (xy1[0] - off, xy1[1] - off)]
-    for xy in clicks:                           # 左键点击两点
-        widget.event_generate("<Motion>", x=xy[0], y=xy[1])
-        widget.event_generate("<ButtonPress-1>", x=xy[0], y=xy[1])
-        widget.event_generate("<ButtonRelease-1>", x=xy[0], y=xy[1])
-        pump(app, 0.6)
+    # 故意偏离轨道 ~3 像素, 检验"自动吸附"是否把点拉回轨道。
+    # 每次点击前都重新按"当前视野"换算像素 —— 布局回调可能已改变视野。
+    clicks = []
+    for i, pt in enumerate((p0, p1)):
+        pump(app, 0.8)
+        xy = to_widget_xy(*pt)
+        off = 3 if i == 0 else -3
+        cx, cy = xy[0] + off, xy[1] + off
+        clicks.append((cx, cy))
+        send(widget, "<Motion>", cx, cy)
+        send(widget, "<ButtonPress-1>", cx, cy)
+        send(widget, "<ButtonRelease-1>", cx, cy)
+        pump(app, 0.8)
     ok = wait_for(app, lambda: app._busy_count == 0 and app.profile.selection is not None,
                   300, "鼠标点击剖面")
     sel_mouse = app.profile.selection
@@ -208,6 +226,9 @@ def main() -> int:
           f"吸附位移 = {raw_err} m, 波束 = {app.map.pick_labels}")
     if any(not isinstance(v, float) or v > 5.0 for v in snap_err):
         print("!! 选点未正确吸附到轨道")
+        return 1
+    if any(v > 500.0 for v in raw_err):
+        print("!! 点击位置与轨道偏差过大 (像素换算/视野不稳定?):", raw_err)
         return 1
     if len(set(labels)) != 1:
         print("!! 两点未吸附到同一条轨道:", labels)
@@ -240,8 +261,8 @@ def main() -> int:
 
     # 缩到很大范围后再点"缩放到剖面线", 应重新框回该直线
     widget_mb = app.map.canvas.get_tk_widget()
-    for _ in range(5):                       # 滚轮缩小, 视野拉大到上千公里
-        widget_mb.event_generate("<MouseWheel>", delta=-120, x=400, y=200)
+    for _ in range(5):                       # 用 API 缩小 (滚轮路径另在 [11] 验证)
+        app.map.zoom(1 / 1.3)
         pump(app, 0.2)
     pump(app, 0.8)
     away_span = (app.map.view[1] - app.map.view[0]) / 1000.0
@@ -259,16 +280,16 @@ def main() -> int:
 
     # 左键拖动不应平移底图, 中键拖动才平移
     before = app.map.view
-    widget.event_generate("<ButtonPress-1>", x=300, y=200)
+    send(widget_mb, "<ButtonPress-1>", 300, 200)
     for x in (340, 400):
-        widget.event_generate("<Motion>", x=x, y=200)
-    widget.event_generate("<ButtonRelease-1>", x=400, y=200)
+        send(widget_mb, "<Motion>", x, 200)
+    send(widget_mb, "<ButtonRelease-1>", 400, 200)
     pump(app, 0.5)
     left_drag_moved = abs(app.map.view[0] - before[0]) / 1000.0
-    widget.event_generate("<ButtonPress-2>", x=300, y=200)
+    send(widget_mb, "<ButtonPress-2>", 300, 200)
     for x in (340, 400):
-        widget.event_generate("<Motion>", x=x, y=200)
-    widget.event_generate("<ButtonRelease-2>", x=400, y=200)
+        send(widget_mb, "<Motion>", x, 200)
+    send(widget_mb, "<ButtonRelease-2>", 400, 200)
     pump(app, 0.6)
     after = app.map.view
     moved = (after[0] - before[0]) / 1000.0
@@ -278,7 +299,7 @@ def main() -> int:
 
     # 滚轮缩放
     w_before = after[1] - after[0]
-    widget.event_generate("<MouseWheel>", delta=120, x=400, y=200)
+    send(widget_mb, "<MouseWheel>", 400, 200, delta=120)
     pump(app, 0.5)
     w_after = app.map.view[1] - app.map.view[0]
     print(f"[11] 滚轮缩放: {w_before / 1000:.1f} km -> {w_after / 1000:.1f} km "
@@ -295,37 +316,120 @@ def main() -> int:
         return 1
     print("[12] 鼠标交互 (左键吸附拾取/中键平移/滚轮缩放) 全部正常, 无回调异常")
 
+    # ---------- 地图 <-> 剖面 联动 ----------
+    app.pick_var.set(False)                 # 浏览模式下左键 = 联动定位
+    app._toggle_pick_mode()
+    pump(app, 0.5)
+    sel_now = app.profile.selection
+    corr_now = app.map.corridor
+    if sel_now is None or corr_now is None:
+        print("!! 切换模式后剖面丢失 (联动无法验证)")
+        return 1
+
+    # (a) 地图轨迹上点一下 -> 剖面高亮对应位置
+    target_along = corr_now.length_m * 0.42
+    tlon, tlat = geo.GEOD.forward(corr_now.p0[0], corr_now.p0[1], corr_now.azimuth,
+                                  target_along)
+    pump(app, 0.5)
+    mx, my = to_widget_xy(tlon, tlat)
+    send(widget_mb, "<ButtonPress-1>", mx, my)
+    send(widget_mb, "<ButtonRelease-1>", mx, my)
+    pump(app, 0.9)
+    m_along = app.profile.marker_along
+    a_chk, c_chk = corr_now.project(tlon, tlat)
+    print(f"[16] 地图点击 (目标沿迹 {target_along:,.0f} m) -> 剖面高亮 "
+          f"{'None' if m_along is None else format(m_along, ',.0f')} m, "
+          f"地图标记={'有' if app.map.link_marker else '无'}")
+    print(f"     点击点回投: 沿迹 {float(a_chk):,.1f} m, 横向 {float(c_chk):+.1f} m")
+    print(f"     状态栏: {app.status_var.get()}")
+    loc = getattr(app, "last_locate", {}) or {}
+    # (1) 应用自洽: 高亮的光子 / 状态栏 / last_locate 必须是同一位置
+    if loc.get("source") != "map" or abs(float(loc.get("along", -1)) - m_along) > 1.0:
+        print(f"!! 联动定位不自洽: marker={m_along}, last_locate={loc}")
+        return 1
+    # (2) 与目标位置接近 (合成点击有若干像素误差, 这里给宽松上限)
+    loose = max(300.0, corr_now.length_m * 0.05)
+    if abs(m_along - target_along) > loose or app.map.link_marker is None:
+        print(f"!! 地图 -> 剖面 联动偏差过大 (容差 {loose:.0f} m)")
+        return 1
+
+    # (b) 剖面上点一下 -> 地图 zoom 到对应位置
+    pick_along = corr_now.length_m * 0.75
+    med_elev = float(np.median(app.profile._plot_elev))
+    ax_px = app.profile.ax.transData.transform((pick_along, med_elev))
+    prof_widget = app.profile.canvas.get_tk_widget()
+    px = int(round(ax_px[0]))
+    py = int(round(app.profile.figure.bbox.height - ax_px[1]))
+    probe = []
+    app.profile.canvas.mpl_connect(
+        "button_press_event",
+        lambda e: probe.append((round(e.x), round(e.y),
+                                None if e.xdata is None else round(float(e.xdata)),
+                                e.inaxes is not None)))
+    send(prof_widget, "<ButtonPress-1>", px, py)
+    send(prof_widget, "<ButtonRelease-1>", px, py)
+    pump(app, 1.4)
+    print(f"     剖面收到事件: {probe} (期望 x={px}, xdata≈{pick_along:.0f})")
+    pa = app.profile._plot_along
+    print(f"     剖面数据: N={0 if pa is None else pa.size}, "
+          f"along {0 if pa is None else pa.min():.0f}~{0 if pa is None else pa.max():.0f} m "
+          f"(走廊 {corr_now.length_m:,.0f} m)")
+    exp_lon, exp_lat = geo.GEOD.forward(corr_now.p0[0], corr_now.p0[1],
+                                        corr_now.azimuth, pick_along)
+    clon, clat = app.map.screen_center_lonlat()
+    err_m = geo.GEOD.distance(float(clon), float(clat), float(exp_lon), float(exp_lat))
+    print(f"[17] 剖面点击 (沿迹 {pick_along:,.0f} m) -> 地图中心 "
+          f"({float(clon):.5f}, {float(clat):.5f}), 距期望位置 {err_m:.0f} m, "
+          f"视野 {(app.map.view[1] - app.map.view[0]) / 1000:.1f} km, "
+          f"剖面高亮 {'None' if app.profile.marker_along is None else round(app.profile.marker_along)} m")
+    print(f"     点击像素=({px},{py}) 画布={prof_widget.winfo_width()}x"
+          f"{prof_widget.winfo_height()} axes={[round(v) for v in app.profile.ax.get_window_extent().bounds]} "
+          f"last_locate={app.last_locate.get('source')}")
+    if err_m > 900.0 or app.map.link_marker is None:
+        print("!! 剖面 -> 地图 联动失败")
+        return 1
+
     # ---------- 天地图底图 + 密钥 ----------
     from icesat_viewer import app as app_module
 
     app.map.zoom_to_bounds(p0[0] - 0.03, p1[0] + 0.03, p0[1] - 0.02, p1[1] + 0.02)
     if is_valid_token_format(app.settings.token):
         app.set_provider("tianditu_img")
-        wait_for(app, lambda: bool(app.map.tile_info), 120, "天地图瓦片")
+        wait_for(app, lambda: bool(app.map.tile_info), 150, "天地图瓦片")
         pump(app, 6.0)
         app.map.save_png(str(OUT / "map_tianditu.png"))
         print(f"[13] 天地图底图: {app.map.tile_info}  (tk={mask_token(app.settings.token)})")
-        if "错误" in app.map.tile_info or "不可用" in app.map.tile_info:
-            print("!! 天地图底图未能加载")
-            return 1
+        if app.map.provider_key.startswith("tianditu"):
+            if "错误" in app.map.tile_info or "不可用" in app.map.tile_info:
+                print("!! 天地图底图未能加载")
+                return 1
+        else:
+            # 密钥被限流 (HTTP 418) 时程序会临时降级到 Esri —— 这是预期行为
+            print(f"     天地图暂不可用 (可能限流), 已自动降级: {app.status_var.get()[:60]}")
+            if "418" not in (app._last_basemap_error or "") \
+                    and "限流" not in (app._last_basemap_error or ""):
+                print("!! 底图既没加载也没有给出限流原因")
+                return 1
     else:
         print(f"[13] 跳过天地图: 当前密钥无效 ({mask_token(app.settings.token)})")
 
-    # 无效密钥必须抛异常并在界面上报出来 (换 key 即刻校验, 不受瓦片缓存影响)
-    ask_backup = app_module.messagebox.askyesno
-    app_module.messagebox.askyesno = lambda *a, **k: False     # 自动化: 不弹交互框
+    # 无效密钥必须抛异常上报, 但**绝不能弹模态对话框**卡住用户
     try:
         app._last_basemap_error = ""
         app._apply_token("0" * 32)                             # 格式合法但服务端拒绝
         wait_for(app, lambda: bool(app._last_basemap_error), 120, "无效密钥异常")
         pump(app, 1.0)
         msg = app._last_basemap_error
-        print(f"[14] 无效密钥 -> 状态栏/弹窗异常: {msg[:96]}")
-        if "TiandituTokenError" not in msg:
-            print("!! 无效密钥未抛出 TiandituTokenError")
+        modal = app.grab_current()
+        print(f"[14] 无效密钥 -> 状态栏异常: {msg[:88]}")
+        print(f"     模态对话框: {'有(不允许!)' if modal is not None else '无 (正确)'}")
+        if not ("TiandituTokenError" in msg or "TiandituQuotaError" in msg):
+            print("!! 无效密钥未抛出天地图异常")
+            return 1
+        if modal is not None:
+            print("!! 底图错误弹出了模态对话框, 会打断用户操作")
             return 1
     finally:
-        app_module.messagebox.askyesno = ask_backup
         app._apply_token(app.settings.token)                   # 恢复
         app.map.refresh_tiles(force=True)
         pump(app, 3.0)

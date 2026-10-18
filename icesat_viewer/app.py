@@ -29,9 +29,9 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from . import __version__, geo
-from .basemap import (PROVIDERS, TIANDITU_TOKEN_PATTERN, TiandituTokenError,
-                      TileDownloadError, TileEngine, is_valid_token_format,
-                      mask_token)
+from .basemap import (PROVIDERS, TIANDITU_TOKEN_PATTERN, TiandituQuotaError,
+                      TiandituTokenError, TileDownloadError, TileEngine,
+                      is_valid_token_format, mask_token)
 from .corridor import CorridorGeometry
 from .icesat_io import (BEAM_NAMES, BEAM_ORDER, CONF_CHANNELS, CONF_MODES,
                         ELEV_KINDS, OPEN_FILETYPES, PhotonSelection, ReadOptions,
@@ -91,11 +91,13 @@ class IcesatViewerApp(tk.Tk):
         self._recompute_job = None
         self._busy_count = 0
         self._last_basemap_error = ""
+        self.last_locate: dict = {}          # 最近一次 地图↔剖面 联动定位结果
         #: 界面状态变量 (菜单与工具栏共用, 必须在建菜单之前创建)
         self.pick_var = tk.BooleanVar(value=False)
         self.snap_var = tk.BooleanVar(value=bool(self.settings["snap_to_track"]))
         self.auto_zoom_var = tk.BooleanVar(
             value=bool(self.settings["auto_zoom_to_corridor"]))
+        self.link_var = tk.BooleanVar(value=bool(self.settings["link_highlight"]))
 
         self._init_style()
         self._build_menu()
@@ -178,6 +180,8 @@ class IcesatViewerApp(tk.Tk):
         m_profile.add_checkbutton(label="确定直线后自动缩放到该直线",
                                   variable=self.auto_zoom_var,
                                   command=self._toggle_auto_zoom)
+        m_profile.add_checkbutton(label="地图 ↔ 剖面联动 (互点互定位)",
+                                  variable=self.link_var, command=self._toggle_link)
         m_profile.add_command(label="计算/刷新剖面", accelerator="F5",
                               command=lambda: self.compute_profile(reason="手动刷新"))
         m_profile.add_command(label="清除拾取", accelerator="Esc", command=self.clear_pick)
@@ -193,6 +197,7 @@ class IcesatViewerApp(tk.Tk):
         m_tool.add_command(label="打开瓦片缓存目录", command=lambda: self._open_dir(TILE_CACHE_DIR))
         m_tool.add_command(label="打开索引缓存目录", command=lambda: self._open_dir(INDEX_CACHE_DIR))
         m_tool.add_command(label="清空瓦片缓存", command=self.clear_tile_cache)
+        m_tool.add_command(label="底图错误详情…", command=self.show_basemap_error)
         m_tool.add_separator()
         m_tool.add_command(label="数据详情…", command=self.show_dataset_info)
         m_tool.add_command(label="生成演示数据 (合成 ATL03)…", command=self.make_demo_data)
@@ -261,7 +266,7 @@ class IcesatViewerApp(tk.Tk):
         self.zoom_button.pack(side="left", padx=3)
 
         ttk.Label(bar2, foreground="#78909c",
-                  text="中键拖动平移 · 滚轮缩放 · 左键点击拾取(自动吸附) · 右键/Esc 清除"
+                  text="中键拖动平移 · 滚轮缩放 · 左键拾取/联动定位 · 右键/Esc 清除"
                   ).pack(side="right")
 
     # ------------------------------------------------------------------
@@ -320,7 +325,8 @@ class IcesatViewerApp(tk.Tk):
 
         self.map = MapCanvas(right, self.tile_engine, provider=self.provider_var.get(),
                              dpi=self.dpi, on_status=self._on_map_status,
-                             on_pick=self._on_pick, on_basemap_error=self._on_basemap_error)
+                             on_pick=self._on_pick, on_basemap_error=self._on_basemap_error,
+                             on_locate=self._on_map_locate)
         self.map.snap_function = self._snap_lookup
         self.map.snap_enabled = bool(self.settings["snap_to_track"])
         self.map.snap_px = float(self.settings["snap_px"])
@@ -392,7 +398,8 @@ class IcesatViewerApp(tk.Tk):
                                                                            padx=(3, 2))
         ttk.Button(bar, text="保存剖面图", command=self.export_profile_png).pack(side="right")
 
-        self.profile = ProfileCanvas(parent, dpi=self.dpi, on_status=self._on_map_status)
+        self.profile = ProfileCanvas(parent, dpi=self.dpi, on_status=self._on_map_status,
+                                     on_locate=self._on_profile_locate)
         self.profile.pack(side="top", fill="both", expand=True)
 
     # ------------------------------------------------------------------
@@ -400,8 +407,9 @@ class IcesatViewerApp(tk.Tk):
         bar = ttk.Frame(self, padding=(6, 3))
         bar.pack(side="bottom", fill="x")
         self.status_var = tk.StringVar(value="就绪 — 请先打开 ICESat 数据 (文件 → 打开)")
-        ttk.Label(bar, textvariable=self.status_var, anchor="w").pack(
-            side="left", fill="x", expand=True)
+        ttk.Style(self).configure("Error.TLabel", foreground="#c62828")
+        self.status_label = ttk.Label(bar, textvariable=self.status_var, anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
         self.progress = ttk.Progressbar(bar, mode="determinate", length=150, maximum=100)
         self.progress.pack(side="right", padx=6)
         self.tile_var = tk.StringVar(value="")
@@ -432,8 +440,12 @@ class IcesatViewerApp(tk.Tk):
         else:
             self.status_var.set(text)
 
-    def _status(self, text: str) -> None:
-        self.status_var.set(text)
+    def _status(self, text: str, error: bool = False) -> None:
+        self.status_var.set(("⚠ " + text) if error else text)
+        try:
+            self.status_label.configure(style="Error.TLabel" if error else "TLabel")
+        except Exception:
+            pass
 
     def _progress_begin(self, text: str) -> None:
         self._busy_count += 1
@@ -695,6 +707,75 @@ class IcesatViewerApp(tk.Tk):
                      if enabled else "已关闭: 确定剖切线后保持当前视野")
 
     # ------------------------------------------------------------------
+    # 地图 <-> 剖面 联动
+    # ------------------------------------------------------------------
+    def _on_map_locate(self, lon: float, lat: float) -> None:
+        """浏览模式下点击地图轨迹 -> 在剖面上高亮对应位置."""
+        corridor = self.map.corridor
+        selection = self.profile.selection
+        if corridor is None or selection is None or len(selection) == 0:
+            self._status("请先用两点生成剖切面, 再点击轨迹查看对应剖面位置")
+            return
+        if not self.link_var.get():
+            return
+        along, cross = corridor.project(lon, lat)
+        along = float(np.clip(along, 0.0, corridor.length_m))
+        hw = float(corridor.half_width_m)
+        cross = float(np.clip(cross, -hw, hw))
+        # 在光子集合里找 (沿迹, 横向) 最接近点击位置的光子
+        dist2 = (np.asarray(selection.along) - along) ** 2 \
+            + (np.asarray(selection.cross) - cross) ** 2
+        idx = int(np.argmin(dist2))
+        idx = int(np.clip(idx, 0, len(selection) - 1))
+        sel_along = float(selection.along[idx])
+        elev = float(selection.display_elev(self.elev_var.get())[idx])
+        self.profile.set_marker(sel_along, elev,
+                                label=f"{sel_along:,.0f} m / {elev:,.2f} m")
+        self.map.set_link_marker(float(selection.lon[idx]), float(selection.lat[idx]),
+                                 label=f"沿迹 {sel_along:,.0f} m")
+        self.last_locate = {"source": "map", "along": sel_along, "elev": elev,
+                            "lon": float(selection.lon[idx]),
+                            "lat": float(selection.lat[idx])}
+        self._status(f"地图点击 → 剖面定位: 沿迹 {sel_along:,.0f} m, 高程 {elev:,.2f} m "
+                     f"(横向偏距 {float(selection.cross[idx]):+.1f} m)")
+
+    def _on_profile_locate(self, along: float, elev: float) -> None:
+        """点击剖面 -> 地图 zoom 到该位置."""
+        corridor = self.map.corridor
+        selection = self.profile.selection
+        if corridor is None or selection is None or len(selection) == 0:
+            return
+        if not self.link_var.get():
+            return
+        sel = selection
+        # 先把点击位置吸附到实际光子 (更符合"点光子看位置")
+        photon = self.profile.nearest_photon(along, elev)
+        if photon is not None:
+            along = photon[0]
+        along = float(np.clip(along, 0.0, corridor.length_m))
+        lon, lat = geo.GEOD.forward(corridor.p0[0], corridor.p0[1], corridor.azimuth, along)
+        idx = int(np.argmin(np.abs(np.asarray(sel.along) - along)))
+        self.profile.set_marker(along, photon[1] if photon else None,
+                                label=f"{along:,.0f} m")
+        self.map.set_link_marker(float(sel.lon[idx]), float(sel.lat[idx]),
+                                 label=f"沿迹 {along:,.0f} m")
+        span = float(np.clip(corridor.length_m * 0.10, 1500.0, 20000.0))
+        self.map.zoom_to_point(float(lon), float(lat), span_m=span)
+        self.last_locate = {"source": "profile", "along": along,
+                            "elev": photon[1] if photon else elev,
+                            "lon": float(lon), "lat": float(lat)}
+        self._status(f"剖面点击 → 地图定位: 沿迹 {along:,.0f} m → "
+                     f"{float(lon):.5f}°E, {float(lat):.5f}°N (视野 {span / 1000:.1f} km)")
+
+    def _toggle_link(self) -> None:
+        enabled = bool(self.link_var.get())
+        self.settings["link_highlight"] = enabled
+        if not enabled:
+            self.profile.clear_marker()
+            self.map.clear_link_marker()
+        self._status("已开启地图↔剖面联动 (互点互定位)" if enabled else "已关闭联动高亮")
+
+    # ------------------------------------------------------------------
     def _toggle_snap(self) -> None:
         enabled = bool(self.snap_var.get())
         self.map.set_snap(enabled)
@@ -815,6 +896,7 @@ class IcesatViewerApp(tk.Tk):
         self.settings["conf_channel"] = self.channel_var.get()
         self.settings["elev_kind"] = self.elev_var.get()
         self._refresh_profile_display(selection)
+        self.map.clear_link_marker()          # 新剖面 -> 清空旧的联动标记
         if len(selection) == 0:
             self._status("该直线/廊道内没有 ICESat 光子 — 请检查两点是否位于覆盖区, "
                          "或加大廊道半宽 / 放宽置信度筛选")
@@ -839,6 +921,7 @@ class IcesatViewerApp(tk.Tk):
 
     def clear_pick(self) -> None:
         self.map.clear_pick()
+        self.map.clear_link_marker()
         self.profile.clear()
         self._profile_id += 1
         self._update_zoom_button()
@@ -887,23 +970,20 @@ class IcesatViewerApp(tk.Tk):
     # ==================================================================
     # 视图 / 底图
     # ==================================================================
-    def set_provider(self, key: str) -> None:
+    def set_provider(self, key: str, persist: bool = True) -> None:
         if key not in PROVIDERS:
             return
         provider = PROVIDERS[key]
         if provider.requires_token and not self.settings.has_token:
-            self.provider_var.set(key)
-            if messagebox.askyesno("需要天地图密钥",
-                                   "天地图底图需要 tk 密钥 (免费申请)。\n"
-                                   "是否现在填写?", parent=self):
-                self.open_settings()
-            else:
-                self._status("未配置天地图密钥 — 当前底图可能空白, 可在 工具→天地图密钥 中设置")
-        self.settings["provider"] = key
+            # 不弹模态框, 只在状态栏提示 (用户主动点工具栏"天地图密钥…"即可配置)
+            self._status("天地图底图需要 tk 密钥 — 点工具栏「天地图密钥…」填写后即可使用",
+                         error=True)
         self.provider_var.set(key)
         self.provider_combo.set(provider.name)
         self.map.set_provider(key)
-        self.settings.save()
+        if persist:                    # persist=False 用于临时降级, 不写入配置
+            self.settings["provider"] = key
+            self.settings.save()
 
     def _on_provider_combo(self, event=None) -> None:
         name = self.provider_combo.get()
@@ -1113,16 +1193,36 @@ class IcesatViewerApp(tk.Tk):
 
     # ------------------------------------------------------------------
     def _on_basemap_error(self, exc: Exception) -> None:
-        """底图致命错误 (如密钥无效) 的处理: 状态栏 + 异常对话框 (同一错误只弹一次)."""
+        """底图错误 (密钥无效 / 限流): **只写状态栏, 绝不弹模态对话框**.
+
+        自动弹出的模态框会打断用户操作 (启动时尤其恼人), 因此这里仅记录并提示;
+        需要看完整异常时可点 工具 → 底图错误详情, 或主动点
+        "天地图密钥…→ 校验密钥" (那条路径才弹框, 因为是你主动点的)。
+
+        * 限流 (HTTP 418): 天地图临时不可用, 自动降级到免密钥底图, 保证还能看图;
+        * 密钥无效/过期: 只提示, 不动底图选择 (由用户决定换 key 还是换底图)。
+        """
         detail = f"{type(exc).__name__}: {exc}"
-        self._status(f"底图错误 — {detail}")
-        if detail == self._last_basemap_error:
-            return
         self._last_basemap_error = detail
-        if messagebox.askyesno(
-                "底图错误",
-                f"底图加载失败, 已捕获异常:\n\n{detail}\n\n是否现在重新配置天地图密钥?",
-                parent=self):
+        if isinstance(exc, TiandituQuotaError):
+            if self.provider_var.get().startswith("tianditu"):
+                # 仅本次会话降级 (不写入配置): 下次启动仍优先尝试天地图
+                self.set_provider("esri_img", persist=False)
+                self._status("天地图访问受限 (HTTP 418 限流/配额), 已临时改用 Esri 影像底图 — "
+                             "稍后可在「底图」下拉框切回天地图", error=True)
+                return
+            self._status(f"底图限流 — {detail}", error=True)
+            return
+        self._status(f"底图不可用 — {detail} (工具→底图错误详情 可查看)", error=True)
+
+    def show_basemap_error(self) -> None:
+        """用户主动查看底图错误详情 (这里才用对话框)."""
+        if not self._last_basemap_error:
+            messagebox.showinfo("底图错误详情", "当前没有底图错误。", parent=self)
+            return
+        if messagebox.askyesno("底图错误详情",
+                               f"{self._last_basemap_error}\n\n是否现在重新配置天地图密钥?",
+                               parent=self):
             self.open_settings()
 
     # ------------------------------------------------------------------
@@ -1155,7 +1255,7 @@ class IcesatViewerApp(tk.Tk):
         threading.Thread(target=work, daemon=True, name="token-check").start()
 
     def _validate_token_on_startup(self) -> None:
-        """启动后在后台校验一次密钥; 无效则抛出异常并提示 (不阻塞界面)."""
+        """启动后在后台校验一次密钥 (静默: 只写状态栏, 绝不弹模态框)."""
         if self.settings.has_token:
             self._validate_token(self.settings.token)
 
@@ -1220,19 +1320,21 @@ class IcesatViewerApp(tk.Tk):
     # 启动 / 关闭
     # ==================================================================
     def _startup_hint(self) -> None:
+        """启动提示: 全部静默, 只写状态栏 (绝不弹模态框打断用户)."""
         provider = self.provider_var.get()
         if PROVIDERS[provider].requires_token and not self.settings.has_token:
             self.set_provider("esri_img")
             self._status("未配置天地图 tk 密钥, 已临时使用免密钥备用底图 — "
                          "可在 工具栏→天地图密钥 中填写后切换")
             return
-        if self.settings.has_token:
-            self._status(f"就绪 — 底图: {PROVIDERS[provider].name} "
-                         f"(tk={mask_token(self.settings.token)}, 正在校验…); "
-                         "请打开 ICESat 数据 (Ctrl+O)")
-            self._validate_token_on_startup()      # 后台校验, 无效则抛出异常提示
-        if self.settings.has_token and provider.startswith("tianditu"):
-            self.map.set_provider(provider)
+        if not self.settings.has_token:
+            self._status("就绪 — 请打开 ICESat 数据 (Ctrl+O)")
+            return
+        self._status(f"就绪 — 底图: {PROVIDERS[provider].name} "
+                     f"(tk={mask_token(self.settings.token)})")
+        if PROVIDERS[provider].requires_token:
+            # 仅在真正使用天地图时才后台校验密钥; 失败只写状态栏
+            self._validate_token_on_startup()
 
     def _push_recent(self, path: str) -> None:
         recent = [p for p in self.settings.get("recent_files", []) if p != path]
@@ -1322,21 +1424,30 @@ HELP_TEXT = """ICESat 光子剖面查看器 — 使用说明
 五、地图操作
     中键拖动   : 平移底图
     滚轮       : 以光标为中心缩放
-    左键单击   : 拾取剖面点 (需处于拾取模式, 自动吸附到轨道)
+    左键单击   : 拾取剖面点 (拾取模式) / 联动定位 (浏览模式, 见下)
     左键双击   : 缩放 (有剖切线时缩放到该直线, 否则缩放到数据范围)
     右键 / Esc : 清除拾取
     上/右侧刻度为经纬度; 状态栏实时显示光标经纬度、底图级别与瓦片状态。
+
+六、地图 ↔ 剖面 联动 (默认开启, 可在 剖面 菜单关闭)
+    • 在浏览模式 (不勾选"拾取剖面") 下, 点击地图轨迹上的任意一点:
+      剖面图上会出现红色竖虚线 + 亮点, 标出该位置对应的光子
+      (状态栏给出沿迹距离、高程与横向偏距);
+      地图上同时用红色圆环标出该光子的实际位置。
+    • 反过来, 点击剖面图上的任意一点 (或某个光子):
+      地图立即 zoom 到该点对应的经纬度 (沿迹距离换算成经纬度),
+      并在剖面与地图上同时高亮该位置, 便于核对"剖面上的起伏对应地图上哪里"。
 
     关于"缩放到数据": 选完两点、确定剖切线之后, 该按钮会变为"缩放到剖面线",
     点击 (或 Ctrl+D / 双击地图) 即把视野精确框到这条 A→B 直线上 (含廊道宽度);
     清除拾取后自动恢复为"缩放到数据", 即整个数据集范围。
     确定两点时也会自动执行一次该缩放 (可在 剖面 菜单里关闭)。
 
-六、导出
+七、导出
     文件 → 导出剖面数据 (CSV, 含 lon/lat/高程/沿迹距离/横向偏距/波束)
     文件 → 导出剖面图 (PNG) / 导出地图视图 (PNG)
 
-七、性能提示
+八、性能提示
     • ATL03 首次打开会建立段索引 (约 1~3 s) 并缓存到 ~/.icesat_tdt_viewer/index,
       再次打开同一文件瞬时完成;
     • 瓦片缓存位于 ~/.icesat_tdt_viewer/tiles, 可在 工具 菜单中清理;

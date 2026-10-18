@@ -27,12 +27,20 @@ class ProfileCanvas(ttk.Frame):
 
     def __init__(self, master, *, dpi: float = 100.0,
                  on_status: Optional[Callable[[str, str], None]] = None,
+                 on_locate: Optional[Callable[[float, float], None]] = None,
                  max_plot_points: int = 600000):
         super().__init__(master)
         self.on_status = on_status or (lambda text, where="left": None)
+        self.on_locate = on_locate            # 点击剖面 -> 回调 (沿迹距离, 高程)
         self.max_plot_points = int(max_plot_points)
         self.selection: Optional[PhotonSelection] = None
         self.elev_kind = ELEV_KINDS[0]
+        #: 联动高亮 (地图 <-> 剖面)
+        self.marker_along: Optional[float] = None
+        self.marker_elev: Optional[float] = None
+        self._marker_artists: list = []
+        self._plot_along: Optional[np.ndarray] = None
+        self._plot_elev: Optional[np.ndarray] = None
 
         self.figure = Figure(figsize=(7.2, 2.9), dpi=dpi, facecolor="#fbfbfc")
         self.ax = self.figure.add_axes([0.075, 0.165, 0.695, 0.755])
@@ -47,13 +55,94 @@ class ProfileCanvas(ttk.Frame):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         # matplotlib 自带 <Configure> 处理函数, 会同步 figure 尺寸与 backing store,
         # 此处无需再绑定 (追加绑定 "add=+" 会保留其功能).
+        self.canvas.mpl_connect("button_press_event", self._on_click)
         self.ax.format_coord = self._format_coord
         self._empty("请在地图上点击两点以生成 ICESat 光子剖切面")
+
+    # ==================================================================
+    # 联动: 点击剖面 -> 地图定位 / 高亮
+    # ==================================================================
+    def _on_click(self, event) -> None:
+        """点击剖面图中的一点 -> 回调 (沿迹距离, 高程), 由主窗体把地图定位过去."""
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        if self.on_locate is None or self.selection is None or len(self.selection) == 0:
+            return
+        along = float(np.clip(event.xdata, 0.0, self.selection.corridor.length_m))
+        elev = float(event.ydata) if event.ydata is not None else float("nan")
+        self.on_locate(along, elev)
+
+    def set_marker(self, along: Optional[float], elev: Optional[float] = None,
+                   label: str = "") -> None:
+        """在剖面上高亮一个位置 (垂直虚线 + 亮点 + 文字标注)."""
+        self._clear_marker_artists()
+        self.marker_along, self.marker_elev = along, elev
+        if along is None or self.selection is None:
+            self.canvas.draw_idle()
+            return
+        line = self.ax.axvline(float(along), color="#d81b60", linewidth=1.2,
+                               linestyle=(0, (4, 3)), zorder=7)
+        self._marker_artists.append(line)
+        if elev is not None and np.isfinite(elev):
+            dot, = self.ax.plot([float(along)], [float(elev)], marker="o", markersize=8,
+                                markerfacecolor="none", markeredgecolor="#d81b60",
+                                markeredgewidth=2.0, zorder=8)
+            self._marker_artists.append(dot)
+            text = label or f"{along:,.0f} m / {elev:,.2f} m"
+            ann = self.ax.annotate(text, (float(along), float(elev)),
+                                   textcoords="offset points", xytext=(10, 10),
+                                   fontsize=8.5, color="#880e4f", zorder=8,
+                                   bbox=dict(boxstyle="round,pad=0.25", fc="#fff3f8",
+                                             ec="#f8bbd0", lw=0.8, alpha=0.95))
+            self._marker_artists.append(ann)
+        self.canvas.draw_idle()
+
+    def clear_marker(self) -> None:
+        self.marker_along = self.marker_elev = None
+        self._clear_marker_artists()
+        self.canvas.draw_idle()
+
+    def _clear_marker_artists(self) -> None:
+        for artist in self._marker_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._marker_artists = []
+
+    def nearest_photon(self, along: float, elev: Optional[float] = None):
+        """在剖面上找点击位置对应的光子, 返回 (along, elev) 或 None.
+
+        策略: 先按沿迹距离圈一个窄窗 (1% 线长, 至少 20 m), 再在窗内挑高程最接近
+        点击处的光子 —— 这样"沿迹位置"不会被高程差异带偏。
+        """
+        if self._plot_along is None or self._plot_along.size == 0:
+            return None
+        along_arr = self._plot_along
+        elev_arr = self._plot_elev
+        span = max(float(np.ptp(along_arr)), 1.0)
+        window = max(span * 0.01, 20.0)
+        while True:
+            mask = np.abs(along_arr - float(along)) <= window
+            if mask.any() or window >= span:
+                break
+            window *= 2.0
+        if not mask.any():
+            idx = int(np.argmin(np.abs(along_arr - float(along))))
+        else:
+            cand = np.nonzero(mask)[0]
+            if elev is None or not np.isfinite(elev):
+                idx = int(cand[np.argmin(np.abs(along_arr[cand] - float(along)))])
+            else:
+                idx = int(cand[np.argmin(np.abs(elev_arr[cand] - float(elev)))])
+        return float(along_arr[idx]), float(elev_arr[idx])
 
     # ==================================================================
     def _empty(self, message: str):
         self.ax.clear()
         self.axh.clear()
+        self._marker_artists = []
+        self._plot_along = self._plot_elev = None
         self.ax.grid(True, color="#e2e4e8", linewidth=0.7)
         self.ax.set_axisbelow(True)
         self.ax.set_xticks([])
@@ -66,6 +155,9 @@ class ProfileCanvas(ttk.Frame):
 
     def clear(self, message: str = "请在地图上点击两点以生成 ICESat 光子剖切面"):
         self.selection = None
+        self.marker_along = self.marker_elev = None
+        self._marker_artists = []
+        self._plot_along = self._plot_elev = None
         self._empty(message)
 
     # ==================================================================
@@ -101,6 +193,9 @@ class ProfileCanvas(ttk.Frame):
 
         self.ax.clear()
         self.axh.clear()
+        self._marker_artists = []          # ax.clear() 已移除旧的标记 artist
+        self.marker_along = self.marker_elev = None
+        self._plot_along, self._plot_elev = along_all, elev_all
         self.ax.grid(True, color="#e2e4e8", linewidth=0.7)
         self.ax.set_axisbelow(True)
 

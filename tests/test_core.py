@@ -249,21 +249,24 @@ class TestTiandituToken(unittest.TestCase):
 
     @unittest.skipUnless(NETWORK_OK, "无法访问天地图服务, 跳过在线校验")
     def test_online_rejected_key_raises(self):
-        from icesat_viewer.basemap import TiandituTokenError, TileEngine
+        from icesat_viewer.basemap import BasemapError, TileEngine
         from icesat_viewer.settings import TILE_CACHE_DIR
 
         engine = TileEngine(TILE_CACHE_DIR, token="0" * 32)   # 格式合法但不存在
         try:
-            with self.assertRaises(TiandituTokenError) as ctx:
+            with self.assertRaises(BasemapError) as ctx:
                 engine.validate_provider("tianditu_vec")
-            self.assertIn("403", str(ctx.exception))
+            # 403=密钥无效, 418=限流; 两者都属于"不可用"并已抛异常
+            msg = str(ctx.exception)
+            self.assertTrue("403" in msg or "418" in msg, msg)
         finally:
             engine.close()
 
     @unittest.skipUnless(NETWORK_OK, "无法访问天地图服务, 跳过在线校验")
     def test_online_valid_key_and_cache_not_masking(self):
-        from icesat_viewer.basemap import (PROVIDERS, TiandituTokenError,
-                                           TileEngine, is_valid_token_format)
+        from icesat_viewer.basemap import (PROVIDERS, TiandituQuotaError,
+                                           TiandituTokenError, TileEngine,
+                                           is_valid_token_format)
         from icesat_viewer.settings import TILE_CACHE_DIR, Settings
 
         token = Settings().token
@@ -272,15 +275,18 @@ class TestTiandituToken(unittest.TestCase):
         engine = TileEngine(TILE_CACHE_DIR, token=token)
         try:
             for provider in ("tianditu_img", "tianditu_vec", "tianditu_ter"):
-                engine.validate_provider(provider)          # 不抛异常即通过
+                try:
+                    engine.validate_provider(provider)      # 不抛异常即通过
+                except TiandituQuotaError as exc:
+                    self.skipTest(f"天地图限流/配额用尽, 跳过 (非密钥问题): {exc}")
             arr, info = engine.mosaic("tianditu_img", 12, 3414, 3416, 1674, 1675)
             self.assertIsNone(info["error_exc"])
             self.assertGreater(float(arr[..., :3].std()), 3.0)
             # 已写入缓存的瓦片也不能掩盖"已被服务端拒绝"的密钥
             engine.set_token("0" * 32)
-            with self.assertRaises(TiandituTokenError):
+            with self.assertRaises((TiandituTokenError, TiandituQuotaError)):
                 engine.validate_provider("tianditu_vec")     # 联网校验 -> 抛异常并记住
-            with self.assertRaises(TiandituTokenError):
+            with self.assertRaises((TiandituTokenError, TiandituQuotaError)):
                 engine.load_tile(PROVIDERS["tianditu_img"].base, 12, 3415, 1675,
                                  use_cache=True)             # 该瓦片此时已在内存/磁盘缓存中
         finally:

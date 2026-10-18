@@ -68,7 +68,8 @@ class MapCanvas(ttk.Frame):
                  dpi: float = 100.0, on_status: Optional[Callable[[str, str], None]] = None,
                  on_pick: Optional[Callable[[Tuple[float, float], Tuple[float, float]], None]] = None,
                  on_view_change: Optional[Callable[[Tuple[float, float, float, float]], None]] = None,
-                 on_basemap_error: Optional[Callable[[Exception], None]] = None):
+                 on_basemap_error: Optional[Callable[[Exception], None]] = None,
+                 on_locate: Optional[Callable[[float, float], None]] = None):
         super().__init__(master)
         self.engine = engine
         self.provider_key = provider if provider in PROVIDERS else "esri_img"
@@ -76,6 +77,7 @@ class MapCanvas(ttk.Frame):
         self.on_pick = on_pick
         self.on_view_change = on_view_change
         self.on_basemap_error = on_basemap_error
+        self.on_locate = on_locate            # 浏览模式下左键点击 -> (lon, lat)
 
         self.mode = "pan"                     # pan | pick
         self.picks: List[Tuple[float, float]] = []
@@ -85,6 +87,9 @@ class MapCanvas(ttk.Frame):
         self.half_width_m = 25.0
         self.entries: List = []               # DatasetEntry 列表
         self.show_tracks = True
+        #: 联动高亮位置 (剖面上某点在地图上对应的位置)
+        self.link_marker: Optional[Tuple[float, float]] = None
+        self.link_label: str = ""
         #: 选点吸附: 由 App 注入回调 (lon, lat, tol_m, prefer_label) ->
         #: (lon, lat, 说明文字, 是否吸附成功, label)
         self.snap_function: Optional[Callable] = None
@@ -330,7 +335,9 @@ class MapCanvas(ttk.Frame):
         self.mode = "pick" if mode == "pick" else "pan"
         cursor = "crosshair" if self.mode == "pick" else "fleur"
         self.canvas.get_tk_widget().configure(cursor=cursor)
-        if self.mode == "pan":
+        # 只清掉"未完成的单点拾取"; 已经确定的剖切线必须保留,
+        # 否则切回浏览模式就没法继续看剖面/做联动定位了。
+        if self.mode == "pan" and self.corridor is None and len(self.picks) == 1:
             self.clear_pick(redraw=True)
 
     # ==================================================================
@@ -358,6 +365,18 @@ class MapCanvas(ttk.Frame):
 
     def set_snap(self, enabled: bool):
         self.snap_enabled = bool(enabled)
+
+    def set_link_marker(self, lon: Optional[float], lat: Optional[float] = None,
+                        label: str = "") -> None:
+        """在地图上高亮"剖面上选中位置"对应的点."""
+        self.link_marker = None if lon is None else (float(lon), float(lat))
+        self.link_label = label or ""
+        self._draw_overlays()
+        self.canvas.draw_idle()
+
+    def clear_link_marker(self) -> None:
+        if self.link_marker is not None:
+            self.set_link_marker(None)
 
     def _snap_tolerance_m(self) -> float:
         """吸附容差: snap_px 像素对应的地面距离 (随缩放自适应, 限幅 15 m ~ 5 km)."""
@@ -474,13 +493,19 @@ class MapCanvas(ttk.Frame):
             return
         press = self._press_xy
         self._press_xy = None
-        if self.mode != "pick" or press is None:
+        if press is None:
             return
         if event.inaxes is not self.ax or event.xdata is None:
             return
         moved = abs(event.x - press[0]) + abs(event.y - press[1])
-        if moved < 5:                            # 区分"点击"与"拖动"
+        if moved >= 5:                           # 拖动过就不算点击
+            return
+        if self.mode == "pick":
             self._pick_point(event.xdata, event.ydata)
+        elif self.on_locate is not None and self.corridor is not None:
+            # 浏览模式: 点击轨迹 -> 联动高亮剖面上对应位置
+            lon, lat = geo.mercator_to_lonlat(event.xdata, event.ydata)
+            self.on_locate(float(lon), float(lat))
 
     def _on_scroll(self, event):
         step = getattr(event, "step", 0) or (1 if event.button == "up" else -1)
@@ -686,6 +711,23 @@ class MapCanvas(ttk.Frame):
             ln, = self.ax.plot([x0, cursor[0]], [y0, cursor[1]], color="#d50000",
                                linewidth=1.2, linestyle=":", zorder=5)
             self._overlays.append(ln)
+
+        # 联动高亮: 剖面上选中的位置在地图上的对应点
+        if self.link_marker is not None:
+            lx, ly = geo.lonlat_to_mercator(*self.link_marker)
+            halo, = self.ax.plot([lx], [ly], marker="o", markersize=13,
+                                 markerfacecolor="none", markeredgecolor="#d81b60",
+                                 markeredgewidth=1.6, alpha=0.85, zorder=8)
+            dot, = self.ax.plot([lx], [ly], marker=".", markersize=7, color="#d81b60",
+                                zorder=9)
+            self._overlays.extend([halo, dot])
+            if self.link_label:
+                ann = self.ax.annotate(self.link_label, (lx, ly), textcoords="offset points",
+                                       xytext=(10, -14), fontsize=8.5, color="#880e4f",
+                                       zorder=9,
+                                       bbox=dict(boxstyle="round,pad=0.22", fc="#fff3f8",
+                                                 ec="#f8bbd0", lw=0.8, alpha=0.95))
+                self._overlays.append(ann)
 
     def _track_runs(self, entry) -> List[Tuple[str, np.ndarray, np.ndarray, str]]:
         """按当前视野取轨迹点并切成连续小段 (避免跨段连线)."""

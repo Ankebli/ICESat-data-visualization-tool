@@ -46,7 +46,15 @@ class BasemapError(RuntimeError):
 
 
 class TiandituTokenError(BasemapError):
-    """天地图 tk 密钥缺失 / 格式错误 / 被服务端拒绝 (HTTP 401/403/418)."""
+    """天地图 tk 密钥缺失 / 格式错误 / 被服务端拒绝 (HTTP 401/403)."""
+
+
+class TiandituQuotaError(BasemapError):
+    """天地图接口限流或配额用尽 (HTTP 418).
+
+    注意: 这与"密钥无效"是两件事 —— 密钥本身可能完全正常, 只是请求太频繁,
+    稍后或换网络即可恢复。此时不应把密钥判定为永久失效。
+    """
 
 
 class TileDownloadError(BasemapError):
@@ -219,11 +227,14 @@ class TileEngine:
             raise self._auth_error          # 已知被服务端拒绝, 不再重复请求
 
     def validate_provider(self, provider_key: str, z: int = 12,
-                          x: int = 3415, y: int = 1675) -> None:
+                          x: int = 3415, y: int = 1675, retries: int = 1) -> None:
         """主动校验底图可用性 (默认取一张太湖区域的瓦片).
 
         密钥缺失/格式错误/被拒绝时抛 :class:`TiandituTokenError`,
         网络异常时抛 :class:`TileDownloadError`.
+
+        天地图在限流/瞬时故障时也可能返回 403/418, 因此默认**重试一次**,
+        只有连续失败才认定密钥失效, 避免一次抖动就把密钥判死。
         """
         if provider_key not in PROVIDERS:
             raise BasemapError(f"未知底图: {provider_key}")
@@ -231,15 +242,31 @@ class TileEngine:
         self.require_valid_token(provider.base)
         if provider.label is not None:
             self.require_valid_token(provider.label)
-        try:
-            # use_cache=False: 强制走网络, 避免旧缓存掩盖失效的密钥
-            self.load_tile(provider.base, int(z), int(x), int(y),
-                           allow_download=True, use_cache=False)
-        except BasemapError:
-            raise
-        except Exception as exc:
-            raise TileDownloadError(f"底图不可用 ({provider.name}): {exc}") from exc
-        return
+
+        last_exc: Optional[BasemapError] = None
+        for attempt in range(int(retries) + 1):
+            try:
+                # use_cache=False: 强制走网络, 避免旧缓存掩盖失效的密钥
+                self.load_tile(provider.base, int(z), int(x), int(y),
+                               allow_download=True, use_cache=False)
+                return
+            except (TiandituTokenError, TiandituQuotaError) as exc:
+                last_exc = exc
+                self._auth_error = None              # 清掉"已拒绝", 允许再试一次
+                for source in (provider.base, provider.label):
+                    if source is not None:
+                        self._blocked.pop(source.key, None)
+                if attempt >= int(retries):
+                    break
+                time.sleep(0.8)                      # 限流抖动时稍等再试
+            except BasemapError:
+                raise
+            except Exception as exc:
+                raise TileDownloadError(f"底图不可用 ({provider.name}): {exc}") from exc
+        if last_exc is not None:
+            if isinstance(last_exc, TiandituTokenError):
+                self._auth_error = last_exc          # 记住, 后续调用快速失败
+            raise last_exc
 
     def block_reason(self, source_key: str) -> str:
         """返回当前被熔断的原因 (无则空串)."""
@@ -329,7 +356,13 @@ class TileEngine:
             if resp.status_code != 200 or "image" not in ctype:
                 self.stats["fail"] += 1
                 self.last_error = f"HTTP {resp.status_code} {ctype.split(';')[0]}"
-                if source.requires_token and (resp.status_code in (401, 403, 418)
+                if source.requires_token and resp.status_code == 418:
+                    # 418 = 限流/配额, 密钥本身可能是好的: 熔断 5 分钟, 但不判死密钥
+                    self._blocked[source.key] = (time.time() + 300.0, "HTTP 418 限流")
+                    raise TiandituQuotaError(
+                        f"天地图接口访问过于频繁或配额已用尽 (HTTP 418), "
+                        f"tk={mask_token(self._token)}; 请稍后重试或更换密钥")
+                if source.requires_token and (resp.status_code in (401, 403)
                                               or "html" in ctype.lower()):
                     exc = TiandituTokenError(
                         f"天地图密钥被拒绝 (HTTP {resp.status_code}), "
@@ -359,6 +392,8 @@ class TileEngine:
             return arr
         except TiandituTokenError:
             raise                                   # 密钥异常必须原样抛出
+        except TiandituQuotaError:
+            raise                                   # 限流异常必须原样抛出
         except Exception as exc:  # 网络异常
             self.stats["fail"] += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -415,7 +450,7 @@ class TileEngine:
                     jobs.append((provider.label, z, geo.wrap_tile_x(tx, z), ty))
 
         results: Dict[Tuple[str, int, int, int], np.ndarray] = {}
-        auth_error: Optional[TiandituTokenError] = None
+        auth_error: Optional[BasemapError] = None
         if jobs:
             futures = {self._executor.submit(self.load_tile, s, zz, xx, yy): (s.key, zz, xx, yy)
                        for (s, zz, xx, yy) in jobs}
@@ -427,10 +462,10 @@ class TileEngine:
                     continue
                 try:
                     results[jkey] = fut.result()
-                except TiandituTokenError as exc:
-                    # 密钥无效: 立即停止等待, 用占位块铺满并记录异常
+                except (TiandituTokenError, TiandituQuotaError) as exc:
+                    # 密钥无效 / 限流: 立即停止等待, 用占位块铺满并记录异常
                     auth_error = auth_error or exc
-                    results.setdefault(jkey, self._placeholder("密钥无效"))
+                    results.setdefault(jkey, self._placeholder("密钥受限"))
                     break
                 except Exception:
                     results[jkey] = self._placeholder("")
