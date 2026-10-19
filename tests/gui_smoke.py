@@ -110,7 +110,7 @@ def main() -> int:
     print(f"[4] 剖面完成: {len(sel):,} 光子, 波束 {sel.present_beams()}")
     print(sel.describe())
 
-    app._set_info(sel.describe())
+    app._set_info("\n".join(sel.info_lines()))
     pump(app, 2.0)
 
     app.map.save_png(str(OUT / "map.png"))
@@ -541,6 +541,43 @@ def main() -> int:
         app.map.refresh_tiles(force=True)
         pump(app, 3.0)
     print(f"[15] 恢复密钥后底图: {app.map.tile_info}")
+
+    # ---------- [20] 剖面图文字不能被裁掉 (窗口高度小 + 三行参数栏时最容易出问题) ----------
+    def text_layout_report(tag: str) -> list:
+        fig = app.profile.figure
+        app.profile.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        fig_h = float(fig.bbox.height)
+        fig_w = float(fig.bbox.width)
+        bad = []
+        checks = (("左标题", app.profile.ax._left_title),
+                  ("x 轴标题", app.profile.ax.xaxis.label),
+                  ("直方图 x 轴标题", app.profile.axh.xaxis.label))
+        for name, artist in checks:
+            if not artist.get_text():
+                continue
+            bb = artist.get_window_extent(renderer)
+            if bb.y0 < -0.5 or bb.y1 > fig_h + 0.5:
+                bad.append(f"{name} 垂直被裁 (y={bb.y0:.0f}~{bb.y1:.0f} of {fig_h:.0f})")
+            if bb.x1 > fig_w + 0.5:
+                bad.append(f"{name} 水平被裁 (右端 {bb.x1:.0f} > {fig_w:.0f})")
+        print(f"[20] {tag}: 图形 {fig_w:.0f}x{fig_h:.0f}, "
+              f"标题字号 {app.profile.ax._left_title.get_fontsize():.2f}pt, "
+              f"{'文字完整' if not bad else '裁剪: ' + '; '.join(bad)}")
+        return bad
+
+    problems = text_layout_report("1520x960")
+    for w, h in ((1180, 720), (1366, 768)):
+        app.geometry(f"{w}x{h}")
+        app._layout_panes()
+        pump(app, 1.2)
+        problems += text_layout_report(f"{w}x{h}")
+    app.geometry("1520x960")
+    app._layout_panes()
+    pump(app, 1.0)
+    if problems:
+        print("!! 剖面图文字被裁掉 (布局回归)")
+        return 1
 
     app.after(200, app._on_close)
     pump(app, 1.0)

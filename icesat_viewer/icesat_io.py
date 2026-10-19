@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -52,6 +53,39 @@ CONF_MODES = ("全部", "中等及以上", "仅高置信")
 ELEV_KINDS = ("椭球高", "正交高(减geoid)", "相对高(减中值)")
 
 MAX_READ_PHOTONS = 12_000_000   # 单次剖面最多读取的光子数 (安全阀)
+
+#: ATL03 granule 名里的时间戳: ATL03_20250105065215_03082606_007_01
+_GRANULE_RE = re.compile(r"(ATL\d{2})_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})")
+
+
+def short_source_name(name: str, limit: int = 30) -> str:
+    """把冗长的文件名压成适合窄面板显示的一行 (<= limit 字符).
+
+    ``ATL03_20250105065215_03082606_007_01.h5`` -> ``ATL03 2025-01-05 06:52``
+    """
+    base = str(name).rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    m = _GRANULE_RE.match(base)
+    if m:
+        prod, y, mo, d, hh, mm = m.group(1), m.group(2), m.group(3), m.group(4), \
+            m.group(5), m.group(6)
+        return f"{prod} {y}-{mo}-{d} {hh}:{mm}"
+    stem = base[:-3] if base.lower().endswith(".h5") else base
+    return stem if len(stem) <= limit else stem[:limit - 1] + "…"
+
+
+def compact_count(n: int) -> str:
+    """列表里用的紧凑数量: 87,872,733 -> ``87.9M``."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "-"
+    if n >= 10_000_000:
+        return f"{n / 1e6:.1f}M"
+    if n >= 1_000_000:
+        return f"{n / 1e6:.2f}M"
+    if n >= 10_000:
+        return f"{n / 1e3:.0f}k"
+    return f"{n:,}"
 
 
 # ----------------------------------------------------------------------------
@@ -120,6 +154,33 @@ class PhotonSelection:
 
     def present_beams(self) -> List[str]:
         return sorted(set(str(b) for b in np.unique(self.beam)))
+
+    def info_lines(self) -> List[str]:
+        """左下面板用的多行摘要: 每行 <= 30 字符, 适合窄面板不折行.
+
+        ``describe()`` 面向状态栏 (一行拼接), 这里是给人看的紧凑清单。
+        """
+        from .corridor import elevation_statistics
+
+        cg = self.corridor
+        lines = [short_source_name(self.source)]
+        if cg is not None:
+            lines.append(f"剖线 {cg.length_m / 1000:.2f} km  ±{cg.half_width_m:g} m")
+            lines.append(f"方位 {cg.azimuth:.1f}°")
+            lines.append(f"A {cg.p0[0]:.5f}, {cg.p0[1]:.5f}")
+            lines.append(f"B {cg.p1[0]:.5f}, {cg.p1[1]:.5f}")
+        if len(self):
+            stats = elevation_statistics(self.display_elev("椭球高"))
+            lines.append(f"光子 {len(self):,}"
+                         + (f" (截断 {self.truncated:,})" if self.truncated else ""))
+            lines.append(f"高程 {stats['min']:.2f} ~ {stats['max']:.2f} m")
+            lines.append(f"中值 {stats['median']:.2f} m · 跨度 {stats['range']:.2f} m")
+            bc = self.beam_counts()
+            if bc:
+                lines.append("波束 " + "  ".join(f"{k} {v:,}" for k, v in sorted(bc.items())))
+        if self.note:
+            lines.append(self.note)
+        return lines
 
     def describe(self) -> str:
         from .corridor import elevation_statistics
@@ -1203,8 +1264,12 @@ def merge_selections(selections: Sequence[PhotonSelection],
                                beam=np.array([], dtype="U8"), corridor=corridor)
     geoid = (np.concatenate([p.geoid for p in parts])
              if all(p.geoid is not None for p in parts) else None)
-    notes = [f"{p.source}: {len(p):,} 光子" + (f"({p.note})" if p.note else "")
-             for p in parts]
+    if len(parts) > 1:                       # 多数据源才需要逐项列出光子数
+        notes = [f"{short_source_name(p.source)}: {len(p):,} 光子"
+                 + (f" ({p.note})" if p.note else "")
+                 for p in parts]
+    else:
+        notes = [p.note for p in parts if p.note]
     # extras 只有在所有数据源都具备时才合并 (部分缺失就整体丢弃, 避免长度不一致)
     extras: Dict[str, np.ndarray] = {}
     if parts and all(p.extras for p in parts):

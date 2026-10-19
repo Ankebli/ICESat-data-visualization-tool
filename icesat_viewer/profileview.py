@@ -47,10 +47,13 @@ class ProfileCanvas(ttk.Frame):
         self._note: str = ""
         #: DEM 剖面对比曲线 (along, z, label, stats)
         self._dem_curve: Optional[tuple] = None
+        #: 完整标题文本 (窄画布时按宽度缩字号/省略, 恢复后再还原)
+        self._title_full: str = ""
 
         self.figure = Figure(figsize=(7.2, 2.9), dpi=dpi, facecolor="#fbfbfc")
         self.ax = self.figure.add_axes([0.075, 0.165, 0.695, 0.755])
         self.axh = self.figure.add_axes([0.815, 0.165, 0.165, 0.755], sharey=self.ax)
+        self._apply_layout()
         self.ax.grid(True, color="#e2e4e8", linewidth=0.7)
         self.ax.set_axisbelow(True)
         self.axh.grid(True, axis="x", color="#e8eaee", linewidth=0.6)
@@ -62,8 +65,94 @@ class ProfileCanvas(ttk.Frame):
         # matplotlib 自带 <Configure> 处理函数, 会同步 figure 尺寸与 backing store,
         # 此处无需再绑定 (追加绑定 "add=+" 会保留其功能).
         self.canvas.mpl_connect("button_press_event", self._on_click)
+        self.canvas.mpl_connect("resize_event", lambda _e: self._apply_layout())
         self.ax.format_coord = self._format_coord
         self._empty("请在地图上点击两点以生成 ICESat 光子剖切面")
+
+    # ------------------------------------------------------------------
+    #: 图中文字的字号 (见 set_selection), 边距按这些值换算成像素
+    FONT_TITLE = 9.0
+    FONT_LABEL = 9.0
+    FONT_TICK = 8.0
+    FONT_HIST_LABEL = 8.0
+    FONT_HIST_TICK = 7.0
+
+    def _apply_layout(self) -> None:
+        """按字号像素预算重算四个边距, 避免画布矮时标题/横轴标签被裁掉.
+
+        固定比例边距 (如底 16.5%) 在窗口高度小、画布只有 250 px 时容不下
+        "刻度数字 + 轴标题", 文字会被裁掉一半; 这里改为按实际字体像素高度
+        留边, 并限制在合理区间, 任何窗口尺寸下文字都完整。
+        """
+        fig = self.figure
+        h_px = max(float(fig.bbox.height), 80.0)
+        w_px = max(float(fig.bbox.width), 200.0)
+
+        def px(pt: float) -> float:
+            return pt / 72.0 * float(fig.dpi)
+
+        # 底边: 刻度数字 + 刻度间距 + 轴标题间距 + 轴标题 + 余量
+        bottom_px = (px(max(self.FONT_TICK, self.FONT_HIST_TICK)) * 1.2 + px(3.5) + px(4.0)
+                     + px(max(self.FONT_LABEL, self.FONT_HIST_LABEL)) * 1.35 + 5.0)
+        # 顶边: 标题 (间距 2pt 见 set_title(pad=2))
+        top_px = px(self.FONT_TITLE) * 1.15 + px(2.0) + 4.0
+        left_px = px(self.FONT_TICK) * 2.6 + px(self.FONT_LABEL) * 1.35
+        right_px = px(self.FONT_HIST_TICK) * 4.5
+        bottom = min(max(bottom_px / h_px, 0.12), 0.40)
+        top = min(max(top_px / h_px, 0.07), 0.30)
+        left = min(max(left_px / w_px, 0.045), 0.18)
+        right = min(max(right_px / w_px, 0.03), 0.14)
+        height = 1.0 - bottom - top
+        hist_w = 0.165
+        gap = 0.048
+        ax_w = max(1.0 - left - right - hist_w - gap, 0.35)
+        self.ax.set_position([left, bottom, ax_w, height])
+        self.axh.set_position([left + ax_w + gap, bottom, hist_w, height])
+        self._fit_title()
+
+    def _fit_title(self) -> None:
+        """标题太长时先缩字号 (最低 6.5 pt), 仍放不下就省略尾部, 保证不被裁掉.
+
+        注意 ``ax.title`` 只是"居中标题", ``set_title(loc="left")`` 写的是
+        ``ax._left_title``; 这里对所有非空标题统一处理。
+        """
+        if not self._title_full:
+            return
+        # 标题只在 loc="left" 的 _left_title 上; 其它两个标题保持为空, 否则会重叠
+        for attr in ("_center_title", "_right_title"):
+            other = getattr(self.ax, attr, None)
+            if other is not None and other.get_text():
+                other.set_text("")
+        art = getattr(self.ax, "_left_title", None) or getattr(self.ax, "title", None)
+        canvas = getattr(self.figure, "canvas", None)
+        get_renderer = getattr(canvas, "get_renderer", None)
+        if art is None or get_renderer is None:
+            return
+        try:
+            renderer = get_renderer()
+            pos = self.ax.get_position()
+            avail = float(self.figure.bbox.width) * max(1.0 - pos.x0 - 0.005, 0.2)
+            text = self._title_full
+
+            def apply(value: str, size: float) -> float:
+                art.set_text(value)
+                art.set_fontsize(size)
+                return float(art.get_window_extent(renderer).width)
+
+            size = self.FONT_TITLE
+            width = apply(text, size)
+            if width > avail > 0:
+                size = max(self.FONT_TITLE * avail / width * 0.98, 6.5)
+                width = apply(text, size)
+            # 最小字号仍超出: 按比例截断并加省略号
+            for _ in range(6):
+                if width <= avail or len(text) <= 12:
+                    break
+                keep = max(int(len(text) * avail / max(width, 1.0)) - 1, 12)
+                text = text[:keep].rstrip(" ，,|·") + "…"
+                width = apply(text, size)
+        except Exception:
+            pass
 
     # ==================================================================
     # 联动: 点击剖面 -> 地图定位 / 高亮
@@ -147,6 +236,7 @@ class ProfileCanvas(ttk.Frame):
     def _empty(self, message: str):
         self.ax.clear()
         self.axh.clear()
+        self._title_full = ""
         self._marker_artists = []
         self._plot_along = self._plot_elev = None
         self.ax.grid(True, color="#e2e4e8", linewidth=0.7)
@@ -325,9 +415,9 @@ class ProfileCanvas(ttk.Frame):
                                      fontsize=8.2, color="#0d47a1", zorder=9,
                                      bbox=dict(boxstyle="round,pad=0.25", fc="#e8f1fb",
                                                ec="#90caf9", lw=0.8, alpha=0.95))
-        self.ax.set_xlabel("沿剖切线距离 (m)", fontsize=9)
-        self.ax.set_ylabel(selection.elev_label(elev_kind), fontsize=9)
-        self.ax.tick_params(labelsize=8)
+        self.ax.set_xlabel("沿剖切线距离 (m)", fontsize=self.FONT_LABEL)
+        self.ax.set_ylabel(selection.elev_label(elev_kind), fontsize=self.FONT_LABEL)
+        self.ax.tick_params(labelsize=self.FONT_TICK)
         n_show = int(sig_elev.size) if use_signal else int(elev_all.size)
         count_text = (f"光子数 {elev_all.size:,}" if n_show == elev_all.size
                       else f"光子数 {elev_all.size:,} → 信号 {n_show:,}")
@@ -336,10 +426,13 @@ class ProfileCanvas(ttk.Frame):
                  f"高程 {stats['min']:.2f}~{stats['max']:.2f} m, 中值 {stats['median']:.2f} m")
         if note:
             title = f"{note}    |    {title}"
-        self.ax.set_title(title + stride_note, fontsize=9, color="#333333", loc="left")
+        self._title_full = title + stride_note
+        self.ax.set_title(self._title_full, fontsize=self.FONT_TITLE,
+                          color="#333333", loc="left", pad=2.0)
         if handles or dem_drawn or (highlight is not None and not np.all(highlight)):
             self.ax.legend(fontsize=7.5, loc="upper right", framealpha=0.85,
                            ncol=1, handletextpad=0.3, borderpad=0.3)
+        self._fit_title()
 
         # ---- 右侧高程直方图 (参考模式下只统计信号) ----
         hist_values = sig_elev if use_signal else elev_all
@@ -348,8 +441,8 @@ class ProfileCanvas(ttk.Frame):
             bin_w = (self.ax.get_ylim()[1] - self.ax.get_ylim()[0]) / n_bins
             self.axh.hist(hist_values, bins=n_bins, range=self.ax.get_ylim(),
                           orientation="horizontal", color="#5c7c8a", alpha=0.75)
-            self.axh.set_xlabel(f"光子数 (每 {bin_w:.2f} m)", fontsize=8)
-            self.axh.tick_params(labelsize=7)
+            self.axh.set_xlabel(f"光子数 (每 {bin_w:.2f} m)", fontsize=self.FONT_HIST_LABEL)
+            self.axh.tick_params(labelsize=self.FONT_HIST_TICK)
             self.axh.tick_params(labelleft=False)
             self.axh.set_ylim(self.ax.get_ylim())
             # 信号集中在一两个分箱时, 直方图看起来"是空的", 这里直接标注范围

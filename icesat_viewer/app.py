@@ -38,7 +38,8 @@ from .dem import (DEM_DATUMS, DemComparison, DemError, OpenTopographyDem, Raster
                   corridor_bounds, open_dem_file, sample_along_corridor)
 from .icesat_io import (BEAM_NAMES, BEAM_ORDER, CONF_CHANNELS, CONF_MODES,
                         ELEV_KINDS, OPEN_FILETYPES, PhotonSelection, ReadOptions,
-                        merge_selections, open_dataset)
+                        compact_count, merge_selections, open_dataset,
+                        short_source_name)
 from .demo_data import generate_demo_atl03
 from .mapview import MapCanvas
 from .ml import (REFERENCE_CHOICES, REFERENCE_NONE, REF_DISPLAY_MODES,
@@ -99,6 +100,8 @@ class IcesatViewerApp(tk.Tk):
         self.last_locate: dict = {}          # 最近一次 地图↔剖面 联动定位结果
         self.dem = None                      # 当前 DEM 数据源
         self.last_dem_compare: Optional[DemComparison] = None
+        self.goto_lon_var = tk.StringVar(value="")
+        self.goto_lat_var = tk.StringVar(value="")
         #: 界面状态变量 (菜单与工具栏共用, 必须在建菜单之前创建)
         self.pick_var = tk.BooleanVar(value=False)
         self.snap_var = tk.BooleanVar(value=bool(self.settings["snap_to_track"]))
@@ -109,8 +112,9 @@ class IcesatViewerApp(tk.Tk):
         self._init_style()
         self._build_menu()
         self._build_toolbar()
-        self._build_body(dpi_scale)
+        # 状态栏要先于可扩展的主体 pack, 否则窗口变小时会被主体挤没
         self._build_statusbar()
+        self._build_body(dpi_scale)
         self._bind_keys()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -221,62 +225,60 @@ class IcesatViewerApp(tk.Tk):
         self._refresh_recent_menu()
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _group_label(parent, text: str) -> ttk.Label:
+        """统一的小组标题样式."""
+        return ttk.Label(parent, text=text, foreground="#546e7a",
+                         font=("Microsoft YaHei UI", 9, "bold"))
+
+    @staticmethod
+    def _sep(parent) -> None:
+        ttk.Separator(parent, orient="vertical").pack(side="left", fill="y", padx=8)
+
     def _build_toolbar(self) -> None:
-        # ---- 第一行: 数据 / 底图 / 密钥 / 定位 ----
-        bar = ttk.Frame(self, padding=(6, 5, 6, 0))
+        """单行工具栏: 只放高频操作; 低频功能(定位/说明/密钥)收进菜单."""
+        bar = ttk.Frame(self, padding=(6, 5, 6, 4))
         bar.pack(side="top", fill="x")
 
-        ttk.Button(bar, text="打开 ICESat 数据", command=self.open_files).pack(side="left")
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
-        ttk.Label(bar, text="底图:").pack(side="left")
-        self.provider_combo = ttk.Combobox(bar, state="readonly", width=18,
+        ttk.Button(bar, text="打开数据", width=9, command=self.open_files).pack(side="left")
+        ttk.Button(bar, text="打开 DEM", width=9,
+                   command=self.open_dem_dialog).pack(side="left", padx=(4, 0))
+        self._sep(bar)
+
+        self._group_label(bar, "底图").pack(side="left")
+        self.provider_combo = ttk.Combobox(bar, state="readonly", width=15,
                                            values=[PROVIDERS[k].name for k in PROVIDERS])
         self.provider_combo.set(PROVIDERS[self.provider_var.get()].name
                                 if self.provider_var.get() in PROVIDERS
                                 else list(PROVIDERS.values())[0].name)
-        self.provider_combo.pack(side="left", padx=3)
+        self.provider_combo.pack(side="left", padx=(4, 2))
         self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_combo)
-        self.key_button = ttk.Button(bar, text="天地图密钥…", command=self.open_settings)
-        self.key_button.pack(side="left", padx=(4, 0))
+        self.key_button = ttk.Button(bar, text="密钥…", width=6,
+                                     command=self.open_settings)
+        self.key_button.pack(side="left")
+        self._sep(bar)
 
-        # 右侧: 使用说明 + 经纬度定位
-        ttk.Button(bar, text="使用说明", command=self.show_help).pack(side="right")
-        ttk.Button(bar, text="前往", width=5, command=self.goto_from_toolbar).pack(
-            side="right", padx=(2, 8))
-        self.goto_lat = ttk.Entry(bar, width=9)
-        self.goto_lat.pack(side="right", padx=2)
-        ttk.Label(bar, text="纬度").pack(side="right")
-        self.goto_lon = ttk.Entry(bar, width=9)
-        self.goto_lon.pack(side="right", padx=2)
-        ttk.Label(bar, text="经度").pack(side="right")
-
-        # ---- 第二行: 剖面工具 ----
-        bar2 = ttk.Frame(self, padding=(6, 3, 6, 5))
-        bar2.pack(side="top", fill="x")
-        self.pick_button = ttk.Checkbutton(bar2, text="拾取剖面 (点两点)",
-                                           variable=self.pick_var,
+        self.pick_button = ttk.Checkbutton(bar, text="拾取剖面", variable=self.pick_var,
                                            command=self._toggle_pick_mode)
         self.pick_button.pack(side="left")
-        ttk.Checkbutton(bar2, text="吸附轨道", variable=self.snap_var,
+        ttk.Checkbutton(bar, text="吸附轨道", variable=self.snap_var,
                         command=self._toggle_snap).pack(side="left", padx=(6, 0))
-        ttk.Label(bar2, text="  廊道半宽 ±").pack(side="left")
+        ttk.Label(bar, text="半宽 ±").pack(side="left", padx=(8, 0))
         self.half_width_var = tk.DoubleVar(value=float(self.settings["corridor_half_width_m"]))
-        spin = ttk.Spinbox(bar2, from_=1, to=2000, increment=5, width=6,
+        spin = ttk.Spinbox(bar, from_=1, to=2000, increment=5, width=5,
                            textvariable=self.half_width_var, command=self._on_half_width_change)
-        spin.pack(side="left")
+        spin.pack(side="left", padx=(2, 0))
         spin.bind("<Return>", lambda e: self._on_half_width_change())
-        ttk.Label(bar2, text=" m").pack(side="left")
+        ttk.Label(bar, text="m").pack(side="left", padx=(0, 2))
+        self._sep(bar)
 
-        ttk.Button(bar2, text="计算剖面", command=lambda: self.compute_profile("手动")).pack(
-            side="left", padx=(10, 3))
-        ttk.Button(bar2, text="清除", command=self.clear_pick).pack(side="left")
-        self.zoom_button = ttk.Button(bar2, text="缩放到数据",
+        ttk.Button(bar, text="计算", width=5,
+                   command=lambda: self.compute_profile("手动")).pack(side="left")
+        ttk.Button(bar, text="清除", width=5, command=self.clear_pick).pack(
+            side="left", padx=(4, 0))
+        self.zoom_button = ttk.Button(bar, text="缩放到数据", width=10,
                                       command=self.zoom_current_target)
-        self.zoom_button.pack(side="left", padx=3)
-
-        ttk.Label(bar2, foreground="#78909c",
-                  text="中键拖动平移 · 滚轮缩放 · 左键拾取/联动定位 · 右键/Esc 清除"
-                  ).pack(side="right")
+        self.zoom_button.pack(side="left", padx=(4, 0))
 
     # ------------------------------------------------------------------
     def _build_body(self, dpi_scale: float) -> None:
@@ -284,18 +286,16 @@ class IcesatViewerApp(tk.Tk):
         main.pack(side="top", fill="both", expand=True, padx=6, pady=(0, 4))
 
         # ---------------- 左侧数据面板 ----------------
-        left = ttk.Frame(main, width=286)
+        left = ttk.Frame(main, width=276)
         main.add(left, weight=0)
 
-        ttk.Label(left, text="已加载数据", font=("Microsoft YaHei UI", 9, "bold")).pack(
-            anchor="w", pady=(2, 2))
-        columns = ("vis", "name", "kind", "count")
-        self.tree = ttk.Treeview(left, columns=columns, show="headings", height=8,
+        self._group_label(left, "数据").pack(anchor="w", pady=(2, 2))
+        columns = ("vis", "name", "count")
+        self.tree = ttk.Treeview(left, columns=columns, show="headings", height=6,
                                  selectmode="browse")
-        for col, text, width, anchor in (("vis", "显", 26, "center"),
-                                         ("name", "名称", 84, "w"),
-                                         ("kind", "类型", 46, "center"),
-                                         ("count", "点数", 100, "e")):
+        for col, text, width, anchor in (("vis", "显", 24, "center"),
+                                         ("name", "数据", 78, "w"),
+                                         ("count", "点数", 62, "e")):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor=anchor, stretch=(col == "name"))
         self.tree.pack(fill="x", expand=False)
@@ -303,28 +303,26 @@ class IcesatViewerApp(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_selected_info())
 
         btns = ttk.Frame(left)
-        btns.pack(fill="x", pady=3)
+        btns.pack(fill="x", pady=(3, 6))
         ttk.Button(btns, text="显示/隐藏", width=9, command=self.toggle_visible).pack(side="left")
         ttk.Button(btns, text="缩放到", width=7,
                    command=self.zoom_current_target).pack(side="left", padx=2)
         ttk.Button(btns, text="移除", width=6, command=self.remove_selected).pack(side="left")
 
         # 波束过滤 (ATL03)
-        beam_box = ttk.LabelFrame(left, text="ATL03 波束", padding=3)
-        beam_box.pack(fill="x", pady=(4, 2))
+        self._group_label(left, "波束").pack(anchor="w", pady=(0, 2))
         self.beam_vars: Dict[str, tk.BooleanVar] = {}
-        grid = ttk.Frame(beam_box)
-        grid.pack(fill="x")
+        grid = ttk.Frame(left)
+        grid.pack(fill="x", pady=(0, 6))
         for i, beam in enumerate(BEAM_ORDER):
             var = tk.BooleanVar(value=True)
             self.beam_vars[beam] = var
             ttk.Checkbutton(grid, text=BEAM_NAMES.get(beam, beam), variable=var,
                             command=self._schedule_recompute).grid(
-                row=i // 2, column=i % 2, sticky="w", padx=2)
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 6))
 
-        ttk.Label(left, text="数据信息", font=("Microsoft YaHei UI", 9, "bold")).pack(
-            anchor="w", pady=(6, 2))
-        self.info_text = ScrolledText(left, height=16, width=34, wrap="word",
+        self._group_label(left, "信息").pack(anchor="w", pady=(0, 2))
+        self.info_text = ScrolledText(left, height=10, width=32, wrap="word",
                                       font=("Consolas", 8), state="disabled")
         self.info_text.pack(fill="both", expand=True)
 
@@ -348,101 +346,105 @@ class IcesatViewerApp(tk.Tk):
         self.after(500, self._layout_panes)
 
     def _layout_panes(self) -> None:
-        """初次布局: 地图约占 6 成高, 剖面占 4 成."""
+        """初次布局: 地图约占 6 成高, 剖面保留至少 300 px (绘图区不被挤压)."""
         try:
             self.update_idletasks()
             height = self._main_paned.winfo_height()
             if height > 200:
-                self._main_paned.sashpos(0, int(height * 0.58))
+                pos = int(height * 0.58)
+                pos = min(pos, max(int(height - 300), int(height * 0.45)))
+                self._main_paned.sashpos(0, max(pos, 120))
         except Exception:
             pass
 
     # ------------------------------------------------------------------
     def _build_profile_panel(self, parent: ttk.Frame) -> None:
-        """剖面参数栏: 分两行排布, 避免控件被挤出可视区 (窄窗口也完整可见)."""
-        bar = ttk.Frame(parent, padding=(4, 4, 4, 0))
+        """剖面工具条: 三行按功能分组, 每组以彩色小标题开头, 行宽均衡.
+
+        第 1 行  剖面: 高程基准 / 置信度 / 通道 / 剔除噪声
+        第 2 行  参考: 参考模型 / 显示方式   ┃  DEM: ☐剖切对比 + 设置…
+        第 3 行  显示: ☐面元中值 / 分箱 [/] m / 点大小
+        """
+        bar = ttk.Frame(parent, padding=(6, 4, 6, 2))
         bar.pack(side="top", fill="x")
 
-        # ---------------- 第一行: 高程 / 筛选 ----------------
+        # ---------------- 第 1 行 ----------------
         row1 = ttk.Frame(bar)
         row1.pack(side="top", fill="x")
-        ttk.Label(row1, text="剖切面", font=("Microsoft YaHei UI", 9, "bold")).pack(
-            side="left", padx=(2, 8))
+        self._group_label(row1, "剖面").pack(side="left", padx=(0, 6))
         ttk.Label(row1, text="高程基准").pack(side="left")
         self.elev_var = tk.StringVar(value=str(self.settings["elev_kind"]))
         cb = ttk.Combobox(row1, textvariable=self.elev_var, values=list(ELEV_KINDS),
-                          state="readonly", width=14)
-        cb.pack(side="left", padx=(2, 8))
+                          state="readonly", width=13)
+        cb.pack(side="left", padx=(3, 8))
         cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
 
         ttk.Label(row1, text="置信度").pack(side="left")
         self.conf_var = tk.StringVar(value=str(self.settings["conf_mode"]))
         cb2 = ttk.Combobox(row1, textvariable=self.conf_var, values=list(CONF_MODES),
-                           state="readonly", width=11)
-        cb2.pack(side="left", padx=(2, 6))
+                           state="readonly", width=10)
+        cb2.pack(side="left", padx=(3, 8))
         cb2.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
 
         ttk.Label(row1, text="通道").pack(side="left")
         self.channel_var = tk.StringVar(value=str(self.settings["conf_channel"]))
         cb3 = ttk.Combobox(row1, textvariable=self.channel_var,
-                           values=["自动"] + list(CONF_CHANNELS), state="readonly", width=9)
-        cb3.pack(side="left", padx=(2, 6))
+                           values=["自动"] + list(CONF_CHANNELS), state="readonly", width=8)
+        cb3.pack(side="left", padx=(3, 6))
         cb3.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
-
         self.afterpulse_var = tk.BooleanVar(value=bool(self.settings["remove_afterpulse"]))
-        ttk.Checkbutton(row1, text="剔除噪声标记", variable=self.afterpulse_var,
-                        command=self._schedule_recompute).pack(side="left", padx=(2, 8))
+        ttk.Checkbutton(row1, text="剔除噪声", variable=self.afterpulse_var,
+                        command=self._schedule_recompute).pack(side="left", padx=(2, 0))
 
-        ttk.Label(row1, text="点大小").pack(side="left")
-        self.point_size_var = tk.DoubleVar(value=float(self.settings["point_size"]))
-        ttk.Spinbox(row1, from_=0.3, to=10, increment=0.5, width=4,
-                    textvariable=self.point_size_var,
-                    command=self._refresh_profile_display).pack(side="left", padx=(2, 0))
-
-        # ---------------- 第二行: 显示 / 参考模型 / 导出 ----------------
+        # ---------------- 第 2 行: 参考模型 + DEM 对比 ----------------
         row2 = ttk.Frame(bar)
-        row2.pack(side="top", fill="x", pady=(2, 4))
-        self.surface_var = tk.BooleanVar(value=bool(self.settings["show_surface"]))
-        ttk.Checkbutton(row2, text="面元中值", variable=self.surface_var,
-                        command=self._refresh_profile_display).pack(side="left", padx=(2, 6))
-        ttk.Label(row2, text="分箱").pack(side="left")
-        self.bin_var = tk.DoubleVar(value=float(self.settings["bin_size_m"]))
-        ttk.Spinbox(row2, from_=1, to=500, increment=5, width=5, textvariable=self.bin_var,
-                    command=self._refresh_profile_display).pack(side="left", padx=(2, 0))
-        ttk.Label(row2, text="m").pack(side="left", padx=(0, 10))
-
-        # ---- M0: 参考模型 (ATL03 自带 signal_conf 作为官方基线) ----
-        ttk.Label(row2, text="参考模型", font=("Microsoft YaHei UI", 9, "bold")).pack(
-            side="left")
+        row2.pack(side="top", fill="x", pady=(3, 0))
+        self._group_label(row2, "参考").pack(side="left", padx=(0, 6))
         self.reference_var = tk.StringVar(
             value=str(self.settings["reference_model"] or REFERENCE_NONE))
         cb_ref = ttk.Combobox(row2, textvariable=self.reference_var,
                               values=[REFERENCE_NONE] + list(REFERENCE_CHOICES),
-                              state="readonly", width=22)
-        cb_ref.pack(side="left", padx=(2, 6))
+                              state="readonly", width=17)
+        cb_ref.pack(side="left", padx=(0, 8))
         cb_ref.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
         self.reference_combo = cb_ref          # 供界面回归测试检查可见性
 
-        ttk.Label(row2, text="显示").pack(side="left")
+        ttk.Label(row2, text="方式").pack(side="left")
         self.ref_mode_var = tk.StringVar(
             value=str(self.settings["reference_display"] or "高亮参考信号"))
         cb_mode = ttk.Combobox(row2, textvariable=self.ref_mode_var,
-                               values=list(REF_DISPLAY_MODES), state="readonly", width=12)
-        cb_mode.pack(side="left", padx=(2, 6))
+                               values=list(REF_DISPLAY_MODES), state="readonly", width=9)
+        cb_mode.pack(side="left", padx=(3, 6))
         cb_mode.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
         self.ref_mode_combo = cb_mode
 
-        ttk.Button(row2, text="保存剖面图", command=self.export_profile_png).pack(
-            side="right", padx=(3, 2))
-        ttk.Button(row2, text="导出 CSV", command=self.export_profile_csv).pack(side="right")
-
-        # ---- DEM 剖切对比 ----
+        self._sep(row2)
+        self._group_label(row2, "DEM").pack(side="left", padx=(0, 6))
         self.dem_var = tk.BooleanVar(value=bool(self.settings["dem_enabled"]))
         self.dem_check = ttk.Checkbutton(
-            row2, text="DEM 剖切对比", variable=self.dem_var,
+            row2, text="剖切对比", variable=self.dem_var,
             command=self._on_dem_toggle)
-        self.dem_check.pack(side="left", padx=(10, 4))
-        ttk.Button(row2, text="DEM…", width=6, command=self.open_dem_dialog).pack(side="left")
+        self.dem_check.pack(side="left", padx=(0, 4))
+        ttk.Button(row2, text="设置…", width=6,
+                   command=self.open_dem_dialog).pack(side="left")
+
+        # ---------------- 第 3 行: 显示选项 ----------------
+        row3 = ttk.Frame(bar)
+        row3.pack(side="top", fill="x", pady=(3, 3))
+        self._group_label(row3, "显示").pack(side="left", padx=(0, 6))
+        self.surface_var = tk.BooleanVar(value=bool(self.settings["show_surface"]))
+        ttk.Checkbutton(row3, text="面元中值", variable=self.surface_var,
+                        command=self._refresh_profile_display).pack(side="left", padx=(0, 10))
+        ttk.Label(row3, text="分箱").pack(side="left")
+        self.bin_var = tk.DoubleVar(value=float(self.settings["bin_size_m"]))
+        ttk.Spinbox(row3, from_=1, to=500, increment=5, width=5, textvariable=self.bin_var,
+                    command=self._refresh_profile_display).pack(side="left", padx=(3, 0))
+        ttk.Label(row3, text="m").pack(side="left", padx=(0, 12))
+        ttk.Label(row3, text="点大小").pack(side="left")
+        self.point_size_var = tk.DoubleVar(value=float(self.settings["point_size"]))
+        ttk.Spinbox(row3, from_=0.3, to=10, increment=0.5, width=4,
+                    textvariable=self.point_size_var,
+                    command=self._refresh_profile_display).pack(side="left", padx=(3, 0))
 
         self.profile = ProfileCanvas(parent, dpi=self.dpi, on_status=self._on_map_status,
                                      on_locate=self._on_profile_locate)
@@ -589,7 +591,8 @@ class IcesatViewerApp(tk.Tk):
         entry = DatasetEntry(dataset=dataset, name=dataset.name, color=color)
         self.entries.append(entry)
         self.tree.insert("", "end", iid=str(id(entry)),
-                         values=("✔", entry.name, dataset.kind, f"{dataset.point_count:,}"))
+                         values=("✔", short_source_name(entry.name),
+                                 compact_count(dataset.point_count)))
         self.map.set_datasets(self.entries)
         if len(self.entries) == 1:
             self.map.zoom_to_data()
@@ -952,7 +955,7 @@ class IcesatViewerApp(tk.Tk):
             self._status("该直线/廊道内没有 ICESat 光子 — 请检查两点是否位于覆盖区, "
                          "或加大廊道半宽 / 放宽置信度筛选")
         else:
-            self._set_info(selection.describe())
+            self._set_info("\n".join(selection.info_lines()))
 
     def _refresh_profile_display(self, selection: Optional[PhotonSelection] = None) -> None:
         selection = selection if selection is not None else self.profile.selection
@@ -1109,27 +1112,19 @@ class IcesatViewerApp(tk.Tk):
         self.profile.toggle_histogram(bool(self.show_hist_var.get()))
         self._refresh_profile_display()
 
-    def goto_from_toolbar(self) -> None:
-        try:
-            lon = float(self.goto_lon.get())
-            lat = float(self.goto_lat.get())
-        except Exception:
-            self._status("请输入有效的经纬度, 例如 120.20 / 31.20")
-            return
-        self.map.zoom_to_point(lon, lat, span_m=30000)
-        self._status(f"已定位到 {lon:.5f}°E, {lat:.5f}°N")
-
     def goto_dialog(self) -> None:
+        """跳转到经纬度 (低频功能, 收进对话框)."""
         win = tk.Toplevel(self)
         win.title("跳转到经纬度")
         win.transient(self)
-        frame = ttk.Frame(win, padding=10)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=12)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="经度 (°E)").grid(row=0, column=0, sticky="w")
-        lon_var = tk.StringVar(value=f"{self.goto_lon.get() or '120.20'}")
+        lon_var = tk.StringVar(value=self.goto_lon_var.get() or "120.20")
         ttk.Entry(frame, textvariable=lon_var, width=14).grid(row=0, column=1, padx=4, pady=3)
         ttk.Label(frame, text="纬度 (°N)").grid(row=1, column=0, sticky="w")
-        lat_var = tk.StringVar(value=f"{self.goto_lat.get() or '31.20'}")
+        lat_var = tk.StringVar(value=self.goto_lat_var.get() or "31.20")
         ttk.Entry(frame, textvariable=lat_var, width=14).grid(row=1, column=1, padx=4, pady=3)
         ttk.Label(frame, text="视野宽度 (m)").grid(row=2, column=0, sticky="w")
         span_var = tk.DoubleVar(value=30000.0)
@@ -1137,14 +1132,16 @@ class IcesatViewerApp(tk.Tk):
 
         def apply():
             try:
-                self.map.zoom_to_point(float(lon_var.get()), float(lat_var.get()),
-                                       span_m=float(span_var.get()))
-                self.goto_lon.delete(0, "end")
-                self.goto_lon.insert(0, lon_var.get())
-                self.goto_lat.delete(0, "end")
-                self.goto_lat.insert(0, lat_var.get())
+                lon = float(lon_var.get())
+                lat = float(lat_var.get())
             except Exception:
-                pass
+                messagebox.showinfo("跳转", "请输入有效的经纬度, 例如 120.20 / 31.20",
+                                    parent=win)
+                return
+            self.goto_lon_var.set(lon_var.get())
+            self.goto_lat_var.set(lat_var.get())
+            self.map.zoom_to_point(lon, lat, span_m=float(span_var.get()))
+            self._status(f"已定位到 {lon:.5f}°E, {lat:.5f}°N")
             win.destroy()
 
         ttk.Button(frame, text="前往", command=apply).grid(row=3, column=1, sticky="e", pady=6)
@@ -1373,8 +1370,8 @@ class IcesatViewerApp(tk.Tk):
         enabled = bool(self.dem_var.get())
         self.settings["dem_enabled"] = enabled
         if enabled and self.dem is None:
-            self._status("DEM 对比已开启, 但尚未加载 DEM — 点「DEM…」选择文件或在线获取",
-                         error=True)
+            self._status("DEM 对比已开启, 但尚未加载 DEM — 点「设置…」(或 文件 → 打开 DEM) "
+                         "选择文件或在线获取", error=True)
         elif enabled:
             self._status(f"DEM 对比已开启: {self.dem.describe()}")
         else:
@@ -1689,7 +1686,7 @@ class IcesatViewerApp(tk.Tk):
         if PROVIDERS[provider].requires_token and not self.settings.has_token:
             self.set_provider("esri_img")
             self._status("未配置天地图 tk 密钥, 已临时使用免密钥备用底图 — "
-                         "可在 工具栏→天地图密钥 中填写后切换")
+                         "可在 工具栏「密钥…」 中填写后切换")
             return
         if not self.settings.has_token:
             self._status("就绪 — 请打开 ICESat 数据 (Ctrl+O)")
@@ -1788,6 +1785,10 @@ HELP_TEXT = """ICESat 光子剖面查看器 — 使用说明
       基线": 参考判定为非信号的光子会**淡化成灰色**, 标题显示"参考信号数/总数(占比)"。
       口径可选 高置信(≥4) / 中等及以上(≥3) / 指定通道(陆地·海洋·内陆水体) 等;
       选"无 (不评估)"则恢复普通显示。CSV/LAS 等无 signal_conf 的产品会自动提示不可用。
+    • DEM 剖切对比: 勾选后, 剖面图上叠加 DEM 沿该直线的地形曲线 (蓝色), 并给出
+      Δ = ICESat 中值 − DEM 的均值/标准差、RMSE 与采样点数; 点「设置…」可选择本地
+      栅格 (tif/img/asc/hgt 等)、免密钥地形瓦片或 OpenTopography API。
+    • 点大小      : 剖面散点的像素大小 (0.3~10), 光子密集时调小更易看清结构。
 
 五、地图操作
     中键拖动   : 平移底图

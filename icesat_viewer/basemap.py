@@ -217,7 +217,7 @@ class TileEngine:
         token = (self._token or "").strip()
         if not token:
             raise TiandituTokenError(
-                "未配置天地图 tk 密钥。请在 工具栏→天地图密钥 中填写 "
+                "未配置天地图 tk 密钥。请在 工具栏「密钥…」 中填写 "
                 "(免费申请: https://console.tianditu.gov.cn/api/key), "
                 "或设置环境变量 TIANDITU_TK。")
         if not is_valid_token_format(token):
@@ -367,7 +367,7 @@ class TileEngine:
                     exc = TiandituTokenError(
                         f"天地图密钥被拒绝 (HTTP {resp.status_code}), "
                         f"tk={mask_token(self._token)} 无效或已过期; "
-                        f"请到 工具栏→天地图密钥 更换。")
+                        f"请到 工具栏「密钥…」 更换。")
                     self._auth_error = exc
                     self._blocked[source.key] = (time.time() + 180.0, f"HTTP {resp.status_code}")
                     raise exc
