@@ -33,6 +33,9 @@ from .basemap import (PROVIDERS, TIANDITU_TOKEN_PATTERN, TiandituQuotaError,
                       TiandituTokenError, TileDownloadError, TileEngine,
                       is_valid_token_format, mask_token)
 from .corridor import CorridorGeometry
+from .dem import (DEM_DATUMS, DemComparison, DemError, OpenTopographyDem, RasterDem,
+                  TerrariumDem, adjust_dem_to_elev_kind, compare_with_profile,
+                  corridor_bounds, open_dem_file, sample_along_corridor)
 from .icesat_io import (BEAM_NAMES, BEAM_ORDER, CONF_CHANNELS, CONF_MODES,
                         ELEV_KINDS, OPEN_FILETYPES, PhotonSelection, ReadOptions,
                         merge_selections, open_dataset)
@@ -94,6 +97,8 @@ class IcesatViewerApp(tk.Tk):
         self._busy_count = 0
         self._last_basemap_error = ""
         self.last_locate: dict = {}          # 最近一次 地图↔剖面 联动定位结果
+        self.dem = None                      # 当前 DEM 数据源
+        self.last_dem_compare: Optional[DemComparison] = None
         #: 界面状态变量 (菜单与工具栏共用, 必须在建菜单之前创建)
         self.pick_var = tk.BooleanVar(value=False)
         self.snap_var = tk.BooleanVar(value=bool(self.settings["snap_to_track"]))
@@ -142,6 +147,7 @@ class IcesatViewerApp(tk.Tk):
         m_file = tk.Menu(menubar, tearoff=0)
         m_file.add_command(label="打开 ICESat 数据…", accelerator="Ctrl+O",
                            command=self.open_files)
+        m_file.add_command(label="打开 DEM 数据 / 剖切对比…", command=self.open_dem_dialog)
         self.m_recent = tk.Menu(m_file, tearoff=0)
         m_file.add_cascade(label="最近打开", menu=self.m_recent)
         m_file.add_separator()
@@ -200,6 +206,7 @@ class IcesatViewerApp(tk.Tk):
         m_tool.add_command(label="打开索引缓存目录", command=lambda: self._open_dir(INDEX_CACHE_DIR))
         m_tool.add_command(label="清空瓦片缓存", command=self.clear_tile_cache)
         m_tool.add_command(label="底图错误详情…", command=self.show_basemap_error)
+        m_tool.add_command(label="DEM 剖切对比…", command=self.open_dem_dialog)
         m_tool.add_separator()
         m_tool.add_command(label="数据详情…", command=self.show_dataset_info)
         m_tool.add_command(label="生成演示数据 (合成 ATL03)…", command=self.make_demo_data)
@@ -429,6 +436,14 @@ class IcesatViewerApp(tk.Tk):
             side="right", padx=(3, 2))
         ttk.Button(row2, text="导出 CSV", command=self.export_profile_csv).pack(side="right")
 
+        # ---- DEM 剖切对比 ----
+        self.dem_var = tk.BooleanVar(value=bool(self.settings["dem_enabled"]))
+        self.dem_check = ttk.Checkbutton(
+            row2, text="DEM 剖切对比", variable=self.dem_var,
+            command=self._on_dem_toggle)
+        self.dem_check.pack(side="left", padx=(10, 4))
+        ttk.Button(row2, text="DEM…", width=6, command=self.open_dem_dialog).pack(side="left")
+
         self.profile = ProfileCanvas(parent, dpi=self.dpi, on_status=self._on_map_status,
                                      on_locate=self._on_profile_locate)
         self.profile.pack(side="top", fill="both", expand=True)
@@ -521,6 +536,11 @@ class IcesatViewerApp(tk.Tk):
                     messagebox.showerror("错误", f"{message}\n\n{detail[-1500:]}", parent=self)
                 elif kind == "basemap_error":
                     self._on_basemap_error(payload)
+                elif kind == "dem_loaded":
+                    self._on_dem_loaded(payload)
+                elif kind == "dem_error":
+                    self._progress_end()
+                    self._status(f"DEM 加载失败 — {payload}", error=True)
                 elif kind == "status":
                     self._status(payload)
         except queue.Empty:
@@ -940,6 +960,7 @@ class IcesatViewerApp(tk.Tk):
             return
         highlight, note = self._reference_overlay(selection)
         mode = REF_DISPLAY_MODES.get(self.ref_mode_var.get(), "highlight")
+        dem_curve = self._dem_display_curve(selection)
         self.profile.set_selection(
             selection, elev_kind=self.elev_var.get(),
             point_size=float(self.point_size_var.get()),
@@ -947,8 +968,12 @@ class IcesatViewerApp(tk.Tk):
             bin_size_m=float(self.bin_var.get()),
             hist_bins=int(self.settings["hist_bins"]),
             show_histogram=bool(self.show_hist_var.get()),
-            highlight_mask=highlight, ref_mode=mode, note=note)
-        if note:
+            highlight_mask=highlight, ref_mode=mode, note=note,
+            dem_curve=dem_curve)
+        if dem_curve is not None and self.last_dem_compare is not None:
+            cmp = self.last_dem_compare
+            self._status((cmp.summary() + (f" — {cmp.note}" if cmp.note else ""))[:200])
+        elif note:
             self._status(f"{note}  —  " + self.status_var.get()[:130])
         self.settings.update({"elev_kind": self.elev_var.get(),
                               "point_size": float(self.point_size_var.get()),
@@ -1341,6 +1366,259 @@ class IcesatViewerApp(tk.Tk):
         if self.settings.has_token:
             self._validate_token(self.settings.token)
 
+    # ------------------------------------------------------------------
+    # DEM 剖切对比
+    # ------------------------------------------------------------------
+    def _on_dem_toggle(self) -> None:
+        enabled = bool(self.dem_var.get())
+        self.settings["dem_enabled"] = enabled
+        if enabled and self.dem is None:
+            self._status("DEM 对比已开启, 但尚未加载 DEM — 点「DEM…」选择文件或在线获取",
+                         error=True)
+        elif enabled:
+            self._status(f"DEM 对比已开启: {self.dem.describe()}")
+        else:
+            self._status("DEM 对比已关闭 — 仅显示 ICESat 剖面")
+        self._refresh_profile_display()
+
+    def _dem_display_curve(self, selection: Optional[PhotonSelection]) -> Optional[tuple]:
+        """按当前剖面与 DEM 生成对比曲线 ``(along, z, label, stats_text)``."""
+        self.last_dem_compare = None
+        if (self.dem is None or selection is None or len(selection) == 0
+                or not self.dem_var.get()):
+            return None
+        corridor = selection.corridor
+        step = float(self.settings["dem_step_m"] or 2.0)
+        try:
+            along, z = sample_along_corridor(self.dem, corridor, step_m=step)
+        except Exception as exc:
+            self._status(f"DEM 采样失败 — {type(exc).__name__}: {exc}", error=True)
+            return None
+        if along.size == 0:
+            return None
+        if not self.dem.covers(*corridor_bounds(corridor)) and self.dem.bounds:
+            self._status("注意: DEM 未完全覆盖该剖切线, 部分位置无 DEM 值", error=True)
+        z_adj, datum_note = adjust_dem_to_elev_kind(
+            along, z, selection, self.elev_var.get(),
+            dem_is_orthometric=self.dem.is_orthometric,
+            offset_m=float(self.settings["dem_offset_m"] or 0.0))
+
+        # ICESat 侧: 参考模式开启时用信号子集, 否则用全部光子
+        kind = self.elev_var.get()
+        elev_i = selection.display_elev(kind)
+        along_i = np.asarray(selection.along, "f8")
+        mask = self.profile._highlight_mask
+        if mask is not None and mask.size == elev_i.size and bool(np.any(mask)):
+            along_i, elev_i = along_i[mask], elev_i[mask]
+        try:
+            cmp = compare_with_profile(along_i, elev_i, along, z_adj,
+                                       bin_size_m=float(self.bin_var.get() or 20.0))
+        except Exception as exc:
+            cmp = DemComparison(note=f"对比统计失败: {exc}")
+        self.last_dem_compare = cmp
+        parts = [cmp.summary()]
+        if datum_note:
+            parts.append(datum_note)
+        if cmp.note and cmp.n_points > 0:
+            parts.append(cmp.note)
+        stats_text = "  |  ".join(p for p in parts if p)
+        label = f"DEM: {self.dem.name if hasattr(self.dem, 'name') else 'DEM'}"
+        if float(self.settings["dem_offset_m"] or 0.0):
+            label += f" (偏移 {float(self.settings['dem_offset_m']):+.2f} m)"
+        return (along, z_adj, label, stats_text)
+
+    # ------------------------------------------------------------------
+    def open_dem_dialog(self) -> None:
+        """DEM 加载/获取对话框."""
+        win = tk.Toplevel(self)
+        win.title("DEM 剖切对比")
+        win.transient(self)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        status = ttk.Label(frame, text="", foreground="#37474f", wraplength=560,
+                           justify="left")
+        status.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+        def refresh_status(msg: str = "") -> None:
+            cur = self.dem.describe() if self.dem is not None else "未加载 DEM"
+            status.configure(text=(msg + "\n" if msg else "") + "当前: " + cur)
+
+        # ---- 本地文件 ----
+        ttk.Label(frame, text="① 本地 DEM 文件", font=("Microsoft YaHei UI", 9, "bold")
+                  ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 2))
+
+        def pick_file() -> None:
+            path = filedialog.askopenfilename(
+                parent=win, title="打开 DEM 文件",
+                filetypes=[("DEM 栅格", "*.tif *.tiff *.img *.vrt *.asc *.hgt *.grd"),
+                           ("全部文件", "*.*")],
+                initialdir=str(Path(self.settings["dem_last_file"]).parent)
+                if self.settings["dem_last_file"] else None)
+            if not path:
+                return
+            self._load_dem(lambda: open_dem_file(
+                path, datum=self._dem_datum(), bounds_lonlat=self._corridor_bounds()))
+            self.settings["dem_last_file"] = path
+
+        ttk.Button(frame, text="打开文件…", command=pick_file).grid(
+            row=2, column=0, sticky="w", pady=2)
+        ttk.Label(frame, foreground="#78909c",
+                  text="GeoTIFF / IMG / VRT / ASCII Grid 等 (rasterio 读取)").grid(
+            row=2, column=1, columnspan=2, sticky="w", padx=6)
+
+        # ---- 在线获取 ----
+        ttk.Label(frame, text="② 在线获取 (需先在图上拾取两点确定剖切线范围)",
+                  font=("Microsoft YaHei UI", 9, "bold")).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 2))
+
+        def fetch_terrarium() -> None:
+            b = self._corridor_bounds()
+            if b is None:
+                messagebox.showinfo("需要剖切线",
+                                    "请先在地图上拾取两点生成剖切线, 再在线获取 DEM。",
+                                    parent=win)
+                return
+            self._load_dem(lambda: TerrariumDem(
+                b, cache_dir=TILE_CACHE_DIR.parent / "dem", progress=None))
+
+        ttk.Button(frame, text="AWS Terrain Tiles (免密钥)",
+                   command=fetch_terrarium).grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Label(frame, foreground="#78909c",
+                  text="SRTM/ASTER 融合, 免注册, 按走廊范围拼瓦片").grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=6)
+
+        ttk.Label(frame, text="OpenTopography API key").grid(row=5, column=0, sticky="w",
+                                                            pady=2)
+        key_var = tk.StringVar(value=str(self.settings["opentopo_api_key"] or ""))
+        ttk.Entry(frame, textvariable=key_var, width=34).grid(row=5, column=1, sticky="w",
+                                                              padx=6)
+        demtype_var = tk.StringVar(value=str(self.settings["opentopo_demtype"] or "SRTMGL1"))
+        ttk.Combobox(frame, textvariable=demtype_var, width=12, state="readonly",
+                     values=["SRTMGL1", "SRTMGL3", "AW3D30", "COP30", "NASADEM"]).grid(
+            row=5, column=2, sticky="w")
+        ttk.Label(frame, foreground="#78909c",
+                  text="免费申请: portal.opentopography.org (可留空, 用上面的免密钥源)").grid(
+            row=6, column=0, columnspan=3, sticky="w")
+
+        def fetch_opentopo() -> None:
+            b = self._corridor_bounds()
+            if b is None:
+                messagebox.showinfo("需要剖切线",
+                                    "请先在地图上拾取两点生成剖切线, 再在线获取 DEM。",
+                                    parent=win)
+                return
+            self.settings["opentopo_api_key"] = key_var.get().strip()
+            self.settings["opentopo_demtype"] = demtype_var.get()
+            self._load_dem(lambda: OpenTopographyDem(
+                b, api_key=key_var.get().strip(), demtype=demtype_var.get(),
+                datum=self._dem_datum(), cache_dir=TILE_CACHE_DIR.parent / "dem"))
+
+        ttk.Button(frame, text="下载 DEM", command=fetch_opentopo).grid(
+            row=7, column=0, sticky="w", pady=2)
+
+        # ---- 选项 ----
+        opts = ttk.LabelFrame(frame, text="垂直基准与采样", padding=6)
+        opts.grid(row=8, column=0, columnspan=3, sticky="we", pady=(10, 4))
+        ttk.Label(opts, text="DEM 视为").grid(row=0, column=0, sticky="w")
+        self.dem_datum_var = tk.StringVar(value=str(self.settings["dem_datum"]))
+        cb = ttk.Combobox(opts, textvariable=self.dem_datum_var, values=list(DEM_DATUMS),
+                          state="readonly", width=18)
+        cb.grid(row=0, column=1, sticky="w", padx=4)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._on_dem_option_change())
+        ttk.Label(opts, text="垂直偏移 (m)").grid(row=0, column=2, sticky="w", padx=(10, 0))
+        self.dem_offset_var = tk.DoubleVar(value=float(self.settings["dem_offset_m"] or 0.0))
+        ttk.Spinbox(opts, from_=-100, to=100, increment=0.5, width=7,
+                    textvariable=self.dem_offset_var,
+                    command=self._on_dem_option_change).grid(row=0, column=3, sticky="w",
+                                                            padx=4)
+        ttk.Label(opts, text="采样间距 (m)").grid(row=0, column=4, sticky="w", padx=(10, 0))
+        self.dem_step_var = tk.DoubleVar(value=float(self.settings["dem_step_m"] or 2.0))
+        ttk.Spinbox(opts, from_=0.5, to=200, increment=1, width=6,
+                    textvariable=self.dem_step_var,
+                    command=self._on_dem_option_change).grid(row=0, column=5, sticky="w",
+                                                            padx=4)
+        ttk.Label(opts, foreground="#78909c",
+                  text="ATL03 为椭球高; SRTM 类 DEM 为正交高, 程序会按 geoid 自动换算 "
+                       "(太湖处 N≈+7.1 m)").grid(row=1, column=0, columnspan=6, sticky="w",
+                                                 pady=(4, 0))
+
+        # ---- 底部按钮 ----
+        btns = ttk.Frame(frame)
+        btns.grid(row=9, column=0, columnspan=3, sticky="e", pady=(8, 0))
+
+        def export_curve() -> None:
+            if self.last_dem_compare is None or self.profile._dem_curve is None:
+                messagebox.showinfo("导出对比曲线", "当前没有 DEM 对比结果。", parent=win)
+                return
+            path = filedialog.asksaveasfilename(parent=win, title="导出 DEM 对比曲线",
+                                                defaultextension=".csv",
+                                                initialfile="dem_compare.csv",
+                                                filetypes=[("CSV 文件", "*.csv")])
+            if not path:
+                return
+            along, z = self.profile._dem_curve[0], self.profile._dem_curve[1]
+            with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+                fh.write("along_m,dem_elev_m\n")
+                for a, e in zip(along, z):
+                    fh.write(f"{a:.2f},{'' if not np.isfinite(e) else f'{e:.3f}'}\n")
+            self._status(f"DEM 对比曲线已导出: {path}")
+
+        def clear_dem() -> None:
+            self.dem = None
+            self.last_dem_compare = None
+            refresh_status("已清除 DEM")
+            self._refresh_profile_display()
+
+        ttk.Button(btns, text="导出对比曲线 CSV", command=export_curve).pack(side="left",
+                                                                            padx=3)
+        ttk.Button(btns, text="清除 DEM", command=clear_dem).pack(side="left", padx=3)
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="left")
+        refresh_status()
+
+    # ------------------------------------------------------------------
+    def _dem_datum(self) -> str:
+        return str(self.settings["dem_datum"] or DEM_DATUMS[0])
+
+    def _corridor_bounds(self):
+        corridor = self.map.corridor
+        if corridor is None:
+            return None
+        return corridor_bounds(corridor, half_width_m=max(self.map.half_width_m, 25.0))
+
+    def _on_dem_option_change(self) -> None:
+        self.settings["dem_datum"] = self.dem_datum_var.get()
+        try:
+            self.settings["dem_offset_m"] = float(self.dem_offset_var.get())
+            self.settings["dem_step_m"] = float(self.dem_step_var.get())
+        except Exception:
+            pass
+        if self.dem is not None:
+            self.dem.datum = self.dem_datum_var.get()
+        self._refresh_profile_display()
+
+    def _load_dem(self, factory) -> None:
+        """在线程里加载 DEM (下载可能较慢), 完成后刷新对比曲线."""
+        def work():
+            try:
+                dem = factory()
+                self.events.put(("dem_loaded", dem))
+            except DemError as exc:
+                self.events.put(("dem_error", str(exc)))
+            except Exception as exc:
+                self.events.put(("dem_error", f"{type(exc).__name__}: {exc}"))
+
+        self._progress_begin("正在加载 DEM …")
+        threading.Thread(target=work, daemon=True, name="dem-load").start()
+
+    def _on_dem_loaded(self, dem) -> None:
+        self.dem = dem
+        self.dem_var.set(True)
+        self.settings["dem_enabled"] = True
+        self._progress_end(f"DEM 已加载: {dem.describe()}")
+        self._refresh_profile_display()
+
     def clear_tile_cache(self) -> None:
         if not messagebox.askyesno("清空瓦片缓存", "确定要删除磁盘上的全部地图瓦片缓存吗?",
                                    parent=self):
@@ -1403,6 +1681,10 @@ class IcesatViewerApp(tk.Tk):
     # ==================================================================
     def _startup_hint(self) -> None:
         """启动提示: 全部静默, 只写状态栏 (绝不弹模态框打断用户)."""
+        # DEM 开关上次是开着的, 但 DEM 本身不随配置保存 -> 复位为关闭, 避免"勾着却没曲线"
+        if self.dem_var.get() and self.dem is None:
+            self.dem_var.set(False)
+            self.settings["dem_enabled"] = False
         provider = self.provider_var.get()
         if PROVIDERS[provider].requires_token and not self.settings.has_token:
             self.set_provider("esri_img")

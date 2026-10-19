@@ -45,6 +45,8 @@ class ProfileCanvas(ttk.Frame):
         self._highlight_mask: Optional[np.ndarray] = None
         self._ref_mode: str = "highlight"
         self._note: str = ""
+        #: DEM 剖面对比曲线 (along, z, label, stats)
+        self._dem_curve: Optional[tuple] = None
 
         self.figure = Figure(figsize=(7.2, 2.9), dpi=dpi, facecolor="#fbfbfc")
         self.ax = self.figure.add_axes([0.075, 0.165, 0.695, 0.755])
@@ -171,6 +173,7 @@ class ProfileCanvas(ttk.Frame):
                       hist_bins: int = 200, show_histogram: bool = True,
                       highlight_mask: Optional[np.ndarray] = None,
                       ref_mode: str = "highlight", note: str = "",
+                      dem_curve: Optional[tuple] = None,
                       fade_alpha: float = 0.22):
         """绘制剖面.
 
@@ -183,9 +186,13 @@ class ProfileCanvas(ttk.Frame):
 
         ``note`` 追加到标题 (例如参考信号占比); 直方图在 highlight/only 模式下
         只统计信号, 便于看高程分布。
+
+        ``dem_curve``: ``(along, z, label, stats_text)``, 给出时在同一坐标系里
+        叠加 DEM 剖面对比曲线 (DEM 已按当前高程基准换算)。
         """
         self.selection = selection
         self.elev_kind = elev_kind
+        self._dem_curve = dem_curve
         self._highlight_mask = (None if highlight_mask is None
                                 else np.asarray(highlight_mask, dtype=bool))
         self._ref_mode = ref_mode if ref_mode in ("highlight", "only", "all") else "highlight"
@@ -292,8 +299,32 @@ class ProfileCanvas(ttk.Frame):
             ymin, ymax = float(np.min(sig_elev)), float(np.max(sig_elev))
         else:
             ymin, ymax = float(np.min(elev_all)), float(np.max(elev_all))
+        if dem_curve is not None and len(dem_curve) >= 2:
+            _dz = np.asarray(dem_curve[1], dtype="f8")
+            _dz = _dz[np.isfinite(_dz)]
+            if _dz.size:
+                ymin, ymax = min(ymin, float(_dz.min())), max(ymax, float(_dz.max()))
         pad = max((ymax - ymin) * 0.06, 1.0)
         self.ax.set_ylim(ymin - pad, ymax + pad)
+
+        # ---- DEM 剖面对比曲线 ----
+        dem_drawn = False
+        if dem_curve is not None and len(dem_curve) >= 2:
+            d_along = np.asarray(dem_curve[0], "f8")
+            d_z = np.asarray(dem_curve[1], "f8")
+            d_label = dem_curve[2] if len(dem_curve) > 2 and dem_curve[2] else "DEM"
+            d_stats = dem_curve[3] if len(dem_curve) > 3 else ""
+            okd = np.isfinite(d_along) & np.isfinite(d_z)
+            if np.any(okd):
+                self.ax.plot(d_along[okd], d_z[okd], color="#1565c0", linewidth=2.0,
+                             zorder=4, label=d_label)
+                dem_drawn = True
+                if d_stats:
+                    self.ax.annotate(d_stats, xy=(0.012, 0.965),
+                                     xycoords="axes fraction", va="top", ha="left",
+                                     fontsize=8.2, color="#0d47a1", zorder=9,
+                                     bbox=dict(boxstyle="round,pad=0.25", fc="#e8f1fb",
+                                               ec="#90caf9", lw=0.8, alpha=0.95))
         self.ax.set_xlabel("沿剖切线距离 (m)", fontsize=9)
         self.ax.set_ylabel(selection.elev_label(elev_kind), fontsize=9)
         self.ax.tick_params(labelsize=8)
@@ -306,7 +337,7 @@ class ProfileCanvas(ttk.Frame):
         if note:
             title = f"{note}    |    {title}"
         self.ax.set_title(title + stride_note, fontsize=9, color="#333333", loc="left")
-        if handles or (highlight is not None and not np.all(highlight)):
+        if handles or dem_drawn or (highlight is not None and not np.all(highlight)):
             self.ax.legend(fontsize=7.5, loc="upper right", framealpha=0.85,
                            ncol=1, handletextpad=0.3, borderpad=0.3)
 

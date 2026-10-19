@@ -43,6 +43,13 @@ DEFAULTS = {
     "link_highlight": True,          # 地图 ↔ 剖面 联动高亮 (互点互定位)
     "reference_model": "ATL03 高置信 (≥4)",   # M0: 参考模型口径 (官方 signal_conf)
     "reference_display": "高亮参考信号",       # M0: 显示方式 (高亮/仅信号/全部)
+    "dem_enabled": False,            # 是否开启 DEM 剖切对比
+    "dem_datum": "正交高 (EGM96 等)",  # DEM 垂直基准
+    "dem_offset_m": 0.0,             # DEM 手调垂直偏移 (米)
+    "dem_step_m": 2.0,               # DEM 沿剖切线采样间距 (米)
+    "dem_last_file": "",             # 上次打开的 DEM 文件
+    "opentopo_api_key": "",          # OpenTopography API key (可选)
+    "opentopo_demtype": "SRTMGL1",   # OpenTopography DEM 产品
     "max_plot_points": 600000,       # 单次绘制的最大光子数 (超出则抽稀显示)
     "coverage_tolerance_m": 2000.0,  # 判定"位于覆盖区"的距离阈值 (米)
     "last_dir": "",                  # 上次打开数据的目录

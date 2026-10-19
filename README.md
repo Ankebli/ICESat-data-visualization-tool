@@ -125,7 +125,6 @@ run.bat --demo
 ---
 
 ## 4. 剖面参数
-
 | 参数 | 说明 |
 | --- | --- |
 | **吸附轨道** | 选点自动吸附到最近的 ICESat 轨道点；第二点优先吸附到与第一点相同的波束，使剖面尽量沿轨方向 |
@@ -266,12 +265,52 @@ M0 只做一件事：**把 ATL03 自带的 `signal_conf_ph`（NASA 官方信号�
 
 ---
 
-## 9. 已知限制
+## 9. DEM 剖切对比
+
+勾选剖面参数栏的 **「DEM 剖切对比」**（或 文件/工具 → DEM 剖切对比…）后，剖面里会多出一条
+**蓝色 DEM 曲线**，并在左上角给出 DEM 与 ICESat 面元中值线的高差统计。未加载 DEM 或开关关闭时，
+行为与之前完全一致（仅显示 ICESat 剖面）。
+
+三种 DEM 来源：
+
+| 来源 | 说明 | 密钥 |
+| --- | --- | --- |
+| **本地文件** | GeoTIFF / IMG / VRT / ASCII Grid 等（`rasterio` 读取，按走廊窗口局部读入） | 不需要 |
+| **AWS Terrain Tiles** | 免注册，按走廊范围拼瓦片（terrarium 编码），自动选 zoom（默认 ≤16 瓦片） | **不需要** |
+| **OpenTopography API** | 在线下载走廊范围 GeoTIFF（SRTMGL1/GL3、AW3D30、COP30、NASADEM） | 需免费 key |
+
+**垂直基准是这里最容易踩的坑**，程序已自动处理：
+
+* ATL03 `h_ph` 是**椭球高**，SRTM 类 DEM 是**正交高**，两者差一个 geoid 距离 N。
+  太湖实测 **N = +7.13 m**（ATL03 椭球高 8.38 m → 水面正交高 1.25 m），
+  程序会用 ATL03 的 `geophys_corr/geoid` 沿迹插值自动换算，并在对比框里注明
+  （如 `兼容椭球高: DEM + geoid (N≈4.76 m)`）；
+* 面板里可切换「DEM 视为 正交高 / 椭球高」、并可给 **垂直偏移 (m)** 手调；
+* "相对高"模式下两边各自减去中值，只比地形起伏。
+
+引擎自带一个现实提示：**SRTM 类产品在水面没有高程（填充 0 m）**，
+所以湖面/河面上的 DEM 曲线会贴着 0，程序会检测"DEM 段几乎为常数"并给出说明。
+
+实测（真实数据）：内蒙 43.3°N 一段 6 km 走廊，ICESat-2 与 SRTM 对比
+`Δ +1.07 ± 1.50 m（RMSE 1.85 m, n=112）`。
+
+![DEM 对比](docs/screenshot_dem.png)
+
+代码位置 `icesat_viewer/dem.py`（`RasterDem` / `TerrariumDem` / `OpenTopographyDem` /
+`sample_along_corridor` / `adjust_dem_to_elev_kind` / `compare_with_profile`），
+测试 `tests/test_dem.py`（17 项：地形解码、文件采样、基准换算、对比统计、网络源），
+演示脚本 `tests/dem_compare_shot.py`。
+
+---
+
+## 10. 已知限制
 
 * ATL03 单次剖面默认最多读取 400 万光子，超出会随机抽稀并在剖面标题中标注；CSV 导出为抽稀后的结果。
 * 多个数据文件同时显示时，剖面会把各文件的廊道光子合并绘制（按波束/产品着色）。
 * 底图注记层（cva_w/cia_w/cta_w）仅在配置了天地图密钥时可用。
 * M0 参考模型需要数据自带 `signal_conf_ph`（ATL03/ATL08 有；CSV/LAS 没有时会提示不可评估）。
+* DEM 对比中，SRTM 类产品在水面为 0 m（无水面高程）；DEM 与 ICESat 的差异同时包含
+  分辨率差（30 m vs 光子）、植被/建筑穿透差、geoid 模型差，程序只做基准换算与统计，不做改正。
 
 ---
 

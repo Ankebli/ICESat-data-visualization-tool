@@ -440,6 +440,62 @@ def main() -> int:
             return 1
     print("      显示方式切换 (仅信号/全部/高亮) 正常")
 
+    # ---------- DEM 剖切对比 ----------
+    class _FakeDem:
+        """内存 DEM 替身: 沿迹缓坡, 用于验证界面链路 (不依赖 rasterio/网络)."""
+
+        def __init__(self, base_m):
+            self.base_m = float(base_m)
+            self.datum = "椭球高 (WGS84)"
+            self.bounds = None
+            self.resolution_m = 30.0
+            self.name = "测试DEM(内存)"
+
+        @property
+        def is_orthometric(self):
+            return False
+
+        def covers(self, *a):
+            return True
+
+        def sample(self, lon, lat):
+            return np.full(len(np.atleast_1d(lon)), self.base_m)
+
+        def describe(self):
+            return "测试DEM(内存) · 椭球高"
+
+    sel_now = app.profile.selection
+    if sel_now is None:
+        print("!! DEM 测试前没有剖面")
+        return 1
+    elev_now = sel_now.display_elev(app.elev_var.get())
+    mask_now = app.profile._highlight_mask
+    if mask_now is not None and mask_now.size == elev_now.size and np.any(mask_now):
+        elev_now = elev_now[np.asarray(mask_now)]      # 与界面一致: 参考模式下用信号子集
+    base = float(np.nanmedian(elev_now)) + 1.5
+    app.dem = _FakeDem(base)
+    app.dem_var.set(True)
+    app.settings["dem_enabled"] = True
+    app._refresh_profile_display()
+    pump(app, 1.0)
+    curve = app.profile._dem_curve
+    cmp_dem = app.last_dem_compare
+    print(f"[19] DEM 对比: 曲线={'有' if curve is not None else '无'}, "
+          f"DEM 基准 {base:.2f} m, {cmp_dem.summary() if cmp_dem else '-'}")
+    if curve is None or cmp_dem is None or cmp_dem.n_points < 10:
+        print("!! DEM 对比未生效")
+        return 1
+    if abs(cmp_dem.mean_m - 1.5) > 0.3:
+        print(f"!! DEM 高差统计异常: mean={cmp_dem.mean_m:.2f} (期望约 +1.5)")
+        return 1
+    app.dem_var.set(False)
+    app._refresh_profile_display()
+    pump(app, 0.5)
+    if app.profile._dem_curve is not None:
+        print("!! 关闭 DEM 对比后仍残留曲线")
+        return 1
+    print("      关闭开关后恢复为仅 ICESat 剖面 (符合预期)")
+
     # ---------- 天地图底图 + 密钥 ----------
     from icesat_viewer import app as app_module
 
