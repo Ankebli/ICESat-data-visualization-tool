@@ -41,6 +41,9 @@ class ProfileCanvas(ttk.Frame):
         self._marker_artists: list = []
         self._plot_along: Optional[np.ndarray] = None
         self._plot_elev: Optional[np.ndarray] = None
+        #: M0: 参考模型高亮 (True=信号) 与标题注释
+        self._highlight_mask: Optional[np.ndarray] = None
+        self._note: str = ""
 
         self.figure = Figure(figsize=(7.2, 2.9), dpi=dpi, facecolor="#fbfbfc")
         self.ax = self.figure.add_axes([0.075, 0.165, 0.695, 0.755])
@@ -164,10 +167,21 @@ class ProfileCanvas(ttk.Frame):
     def set_selection(self, selection: Optional[PhotonSelection], *,
                       elev_kind: str = ELEV_KINDS[0], point_size: float = 2.0,
                       show_surface: bool = True, bin_size_m: float = 20.0,
-                      hist_bins: int = 200, show_histogram: bool = True):
-        """绘制剖面."""
+                      hist_bins: int = 200, show_histogram: bool = True,
+                      highlight_mask: Optional[np.ndarray] = None,
+                      note: str = "", fade_alpha: float = 0.18):
+        """绘制剖面.
+
+        ``highlight_mask`` (每光子一个布尔值): 给定时 True 用波束颜色正常绘制,
+        False 淡化为灰色 —— 用于展示"参考模型/去噪模型判定为非信号"的光子;
+        ``note`` 追加到标题中 (例如参考信号占比);
+        直方图此时只统计 highlight 部分, 便于看信号的高程分布。
+        """
         self.selection = selection
         self.elev_kind = elev_kind
+        self._highlight_mask = (None if highlight_mask is None
+                                else np.asarray(highlight_mask, dtype=bool))
+        self._note = note
         if selection is None or len(selection) == 0:
             self._empty("该直线范围内未找到 ICESat 光子\n"
                         "请确认两点落在 ICESat 覆盖区内, 或加大廊道宽度")
@@ -177,6 +191,11 @@ class ProfileCanvas(ttk.Frame):
         along_all = np.asarray(selection.along, "f8")
         labels = np.asarray(selection.beam, dtype=str)
         finite = np.isfinite(elev_all) & np.isfinite(along_all)
+        highlight = self._highlight_mask
+        if highlight is not None and highlight.size == finite.size:
+            highlight = highlight[finite]
+        else:
+            highlight = None
         elev_all, along_all, labels = elev_all[finite], along_all[finite], labels[finite]
         if elev_all.size == 0:
             self._empty("剖面内无有效高程值")
@@ -199,11 +218,24 @@ class ProfileCanvas(ttk.Frame):
         self.ax.grid(True, color="#e2e4e8", linewidth=0.7)
         self.ax.set_axisbelow(True)
 
-        # ---- 光子散点 (按波束着色) ----
+        # ---- 光子散点: 先画淡化的"非信号", 再按波束画正常光子 ----
         handles = []
+        if highlight is not None and not np.all(highlight):
+            dim_s = max(float(point_size) * 0.8, 0.6)
+            if isinstance(keep, np.ndarray):
+                sub = ~highlight[keep]
+                xs, ys = along_all[keep][sub], elev_all[keep][sub]
+            else:
+                xs, ys = along_all[~highlight], elev_all[~highlight]
+            if xs.size:
+                self.ax.scatter(xs, ys, s=dim_s, c="#b0bec5", alpha=float(fade_alpha),
+                                linewidths=0, rasterized=True, zorder=1,
+                                label="非信号 (淡化)")
         unique = list(dict.fromkeys(labels.tolist()))
         for i, label in enumerate(unique):
             mask = labels == label
+            if highlight is not None:
+                mask = mask & highlight
             color = BEAM_COLORS.get(label, FALLBACK_COLORS[i % len(FALLBACK_COLORS)])
             if isinstance(keep, np.ndarray):
                 sub = mask[keep]
@@ -213,7 +245,7 @@ class ProfileCanvas(ttk.Frame):
             if xs.size == 0:
                 continue
             self.ax.scatter(xs, ys, s=float(point_size), c=color, alpha=0.6,
-                            linewidths=0, rasterized=True,
+                            linewidths=0, rasterized=True, zorder=3,
                             label=BEAM_NAMES.get(label, label))
             handles.append(label)
 
@@ -237,7 +269,8 @@ class ProfileCanvas(ttk.Frame):
                              zorder=3, label=f"面元中值 ({bin_m:g} m)")
 
         # ---- 统计信息 ----
-        stats = elevation_statistics(elev_all)
+        stats = elevation_statistics(elev_all if highlight is None else elev_all[highlight]
+                                     if np.any(highlight) else elev_all)
         self.ax.set_xlim(0, max(float(selection.corridor.length_m), 1.0))
         ymin, ymax = float(np.min(elev_all)), float(np.max(elev_all))
         pad = max((ymax - ymin) * 0.06, 1.0)
@@ -248,15 +281,18 @@ class ProfileCanvas(ttk.Frame):
         title = (f"光子数 {elev_all.size:,}    中线长 {selection.corridor.length_m:,.0f} m    "
                  f"廊道 ±{selection.corridor.half_width_m:g} m    "
                  f"高程 {stats['min']:.2f}~{stats['max']:.2f} m, 中值 {stats['median']:.2f} m")
+        if note:
+            title = f"{note}    |    {title}"
         self.ax.set_title(title + stride_note, fontsize=9, color="#333333", loc="left")
-        if handles:
+        if handles or (highlight is not None and not np.all(highlight)):
             self.ax.legend(fontsize=7.5, loc="upper right", framealpha=0.85,
                            ncol=1, handletextpad=0.3, borderpad=0.3)
 
-        # ---- 右侧高程直方图 ----
-        if show_histogram:
-            self.axh.hist(elev_all, bins=int(max(hist_bins, 10)), orientation="horizontal",
-                          color="#5c7c8a", alpha=0.75)
+        # ---- 右侧高程直方图 (有 highlight 时只统计信号) ----
+        hist_values = elev_all if highlight is None else elev_all[highlight]
+        if show_histogram and hist_values.size:
+            self.axh.hist(hist_values, bins=int(max(hist_bins, 10)),
+                          orientation="horizontal", color="#5c7c8a", alpha=0.75)
             self.axh.set_xlabel("光子数", fontsize=8)
             self.axh.tick_params(labelsize=7)
             self.axh.tick_params(labelleft=False)

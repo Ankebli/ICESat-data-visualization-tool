@@ -41,6 +41,7 @@ DEFAULTS = {
     "snap_px": 25.0,                 # 吸附容差 (像素, 随缩放自适应)
     "auto_zoom_to_corridor": True,   # 确定剖切线后自动缩放到该直线范围
     "link_highlight": True,          # 地图 ↔ 剖面 联动高亮 (互点互定位)
+    "reference_model": "ATL03 高置信 (≥4)",   # M0: 参考模型口径 (官方 signal_conf)
     "max_plot_points": 600000,       # 单次绘制的最大光子数 (超出则抽稀显示)
     "coverage_tolerance_m": 2000.0,  # 判定"位于覆盖区"的距离阈值 (米)
     "last_dir": "",                  # 上次打开数据的目录

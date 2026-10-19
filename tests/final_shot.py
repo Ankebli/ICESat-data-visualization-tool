@@ -95,10 +95,14 @@ def main() -> int:
            for r, s in zip(app.map.pick_raw, app.map.picks) if r])
     wait_for(app, lambda: app._busy_count == 0 and app.profile.selection is not None,
              300, "剖面")
-    app.conf_var.set("仅高置信")
+    # M0: 用"全部光子 + 官方参考模型"展示去噪效果 (参考判定为非信号的光子淡化为灰色)
+    app.conf_var.set("全部")
+    app.channel_var.set("自动")
+    app.reference_var.set("ATL03 高置信 (≥4)")
     app.compute_profile("最终截图")
-    wait_for(app, lambda: app._busy_count == 0, 300, "高置信剖面")
+    wait_for(app, lambda: app._busy_count == 0, 300, "参考模型剖面")
     pump(app, 4.0)
+    print("参考模型:", getattr(app, "last_reference", {}))
 
     print("底图信息:", app.map.tile_info)
     print(app.profile.selection.describe())

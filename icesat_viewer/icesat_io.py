@@ -578,6 +578,15 @@ class ATL03Dataset(BaseDataset):
         beam = np.concatenate([c["beam"] for c in chunks])
         geoid_parts = [c["geoid"] for c in chunks if c["geoid"] is not None]
         geoid = np.concatenate(geoid_parts) if len(geoid_parts) == len(chunks) else None
+        # 把 ATL03 自带的 signal_conf_ph / quality_ph 一并带出 (供"官方参考模型"与
+        # 指标评估使用; M0 起的模型基础设施都从这里取参考标签)
+        extras: Dict[str, np.ndarray] = {}
+        conf_parts = [c["conf"] for c in chunks if c.get("conf") is not None]
+        if len(conf_parts) == len(chunks):
+            extras["signal_conf_ph"] = np.concatenate(conf_parts)
+        qual_parts = [c["quality"] for c in chunks if c.get("quality") is not None]
+        if len(qual_parts) == len(chunks):
+            extras["quality_ph"] = np.concatenate(qual_parts)
 
         note = ""
         if options.conf_mode != "全部":
@@ -587,7 +596,7 @@ class ATL03Dataset(BaseDataset):
         sel_out = PhotonSelection(lon=lon, lat=lat, elev=elev, along=along, cross=cross,
                                   beam=beam, corridor=corridor, product=self.product,
                                   source=self.name, geoid=geoid, truncated=truncated,
-                                  note=note)
+                                  note=note, extras=extras)
         if options.max_photons and len(sel_out) > options.max_photons:
             keep = np.random.default_rng(0).choice(len(sel_out), size=int(options.max_photons),
                                                    replace=False)
@@ -599,7 +608,8 @@ class ATL03Dataset(BaseDataset):
                                       source=self.name,
                                       geoid=None if geoid is None else geoid[keep],
                                       truncated=truncated + dropped,
-                                      note=note + f"; 超出 {options.max_photons:,} 已随机抽稀")
+                                      note=note + f"; 超出 {options.max_photons:,} 已随机抽稀",
+                                      extras={k: v[keep] for k, v in extras.items()})
         return sel_out
 
     # ------------------------------------------------------------------
@@ -615,21 +625,39 @@ class ATL03Dataset(BaseDataset):
         along, cross = corridor.project(lon, lat)
         keep = (along >= 0.0) & (along <= corridor.length_m) & (np.abs(cross) <= hw)
 
-        # 置信度筛选
-        if options.conf_mode != "全部" and "signal_conf_ph" in dset:
-            conf = self._read_conf(dset, s, e, options.conf_channel)
-            if conf is not None:
-                if options.conf_mode == "中等及以上":
-                    keep &= conf >= 3
-                elif options.conf_mode == "仅高置信":
-                    keep &= conf >= 4
-        # 剔除 afterpulse / 脉冲响应等非 nominal 光子
-        if options.remove_afterpulse and "quality_ph" in dset:
+        # 一次读出 signal_conf_ph / quality_ph: 既用于筛选, 也随选择结果带出
+        # (官方参考模型 signal_conf 与 P/R 指标都依赖它)
+        conf_all = None
+        if "signal_conf_ph" in dset:
             try:
-                quality = dset["quality_ph"][s:e]
-                keep &= (quality == 0)
+                conf_all = np.asarray(dset["signal_conf_ph"][s:e])
+                if conf_all.ndim != 2 or conf_all.shape[1] < 1:
+                    conf_all = None
             except Exception:
-                pass
+                conf_all = None
+        quality_all = None
+        if "quality_ph" in dset:
+            try:
+                quality_all = np.asarray(dset["quality_ph"][s:e])
+            except Exception:
+                quality_all = None
+
+        # 置信度筛选
+        if options.conf_mode != "全部" and conf_all is not None:
+            if options.conf_channel in CONF_CHANNELS:
+                col = int(CONF_CHANNELS[options.conf_channel])
+                conf = (conf_all[:, col] if col < conf_all.shape[1]
+                        else conf_all.max(axis=1))
+            else:
+                conf = conf_all.max(axis=1)
+            conf = conf.astype("i2")
+            if options.conf_mode == "中等及以上":
+                keep &= conf >= 3
+            elif options.conf_mode == "仅高置信":
+                keep &= conf >= 4
+        # 剔除 afterpulse / 脉冲响应等非 nominal 光子
+        if options.remove_afterpulse and quality_all is not None:
+            keep &= (quality_all == 0)
 
         if not np.any(keep):
             return None
@@ -649,10 +677,13 @@ class ATL03Dataset(BaseDataset):
             "along": along[idx_keep], "cross": cross[idx_keep],
             "beam": np.full(idx_keep.size, beam, dtype="U8"),
             "geoid": geoid,
+            "conf": None if conf_all is None else conf_all[idx_keep].astype("i1"),
+            "quality": None if quality_all is None else quality_all[idx_keep].astype("i1"),
         }
 
     @staticmethod
     def _read_conf(dset, s: int, e: int, channel: str):
+        """读取一段光子的置信度 (保留给外部调用; 主流程已在 _read_run 中一次性读出)."""
         try:
             if channel in CONF_CHANNELS:
                 col = CONF_CHANNELS[channel]
@@ -1174,6 +1205,17 @@ def merge_selections(selections: Sequence[PhotonSelection],
              if all(p.geoid is not None for p in parts) else None)
     notes = [f"{p.source}: {len(p):,} 光子" + (f"({p.note})" if p.note else "")
              for p in parts]
+    # extras 只有在所有数据源都具备时才合并 (部分缺失就整体丢弃, 避免长度不一致)
+    extras: Dict[str, np.ndarray] = {}
+    if parts and all(p.extras for p in parts):
+        common = set(parts[0].extras)
+        for part in parts[1:]:
+            common &= set(part.extras)
+        for key in sorted(common):
+            try:
+                extras[key] = np.concatenate([p.extras[key] for p in parts])
+            except Exception:
+                extras.pop(key, None)
     return PhotonSelection(
         lon=np.concatenate([p.lon for p in parts]),
         lat=np.concatenate([p.lat for p in parts]),
@@ -1186,7 +1228,8 @@ def merge_selections(selections: Sequence[PhotonSelection],
         source=" + ".join(p.source for p in parts),
         geoid=geoid,
         truncated=int(sum(p.truncated for p in parts)),
-        note="; ".join(notes))
+        note="; ".join(notes),
+        extras=extras)
 
 
 def open_dataset(path: str | Path, cache_dir: Optional[Path] = None,

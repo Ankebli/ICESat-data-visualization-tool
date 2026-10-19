@@ -389,6 +389,32 @@ def main() -> int:
         print("!! 剖面 -> 地图 联动失败")
         return 1
 
+    # ---------- M0: 官方参考模型 (ATL03 signal_conf) ----------
+    app.profile.clear_marker()
+    app.reference_var.set("ATL03 高置信 (≥4)")
+    app._refresh_profile_display()
+    pump(app, 0.8)
+    ref = getattr(app, "last_reference", {}) or {}
+    mask = app.profile._highlight_mask
+    n_mask = 0 if mask is None else int(mask.size)
+    print(f"[18] 参考模型: {app.reference_var.get()} -> 信号 "
+          f"{ref.get('n_signal', 0):,}/{ref.get('n_total', 0):,} "
+          f"({ref.get('ratio', 0):.1f}%), 掩膜 {n_mask:,} 个光子, "
+          f"标题含说明={'是' if '参考' in (app.profile._note or '') else '否'}")
+    if not ref.get("available") or mask is None or n_mask != len(app.profile.selection):
+        print("!! 参考模型未生效")
+        return 1
+    app.reference_var.set("无 (不评估)")
+    app._refresh_profile_display()
+    pump(app, 0.5)
+    if app.profile._highlight_mask is not None:
+        print("!! 关闭参考模型后仍残留高亮掩膜")
+        return 1
+    app.reference_var.set("ATL03 高置信 (≥4)")
+    app._refresh_profile_display()
+    pump(app, 0.5)
+    print("      关闭/重开参考模型均正常 (无模态框打扰)")
+
     # ---------- 天地图底图 + 密钥 ----------
     from icesat_viewer import app as app_module
 

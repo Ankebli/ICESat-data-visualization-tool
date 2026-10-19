@@ -131,6 +131,7 @@ run.bat --demo
 | **剔除噪声标记** | 剔除 ATL03 `quality_ph ≠ 0` 的光子（afterpulse、脉冲响应等） |
 | **高程基准** | 椭球高（WGS84）/ 正交高（减 `geophys_corr/geoid`）/ 相对高（减中值） |
 | **面元中值** | 沿迹分箱（默认 20 m）的中值曲线 + 10~90% 分位带 |
+| **参考模型 (M0)** | 用 ATL03 自带 `signal_conf_ph` 作官方基线：非信号光子淡化为灰色，标题显示"参考信号数/总数(占比)"。口径可选 高置信(≥4) / 中等及以上(≥3) / 各通道；选"无"恢复普通显示 |
 | **波束过滤** | 左侧面板可单独勾选 gt1l…gt3r 六个波束 |
 
 太湖示例（ATL03，13 km，±25 m，仅高置信 + 内陆水体通道）：52,636 个光子，
@@ -215,8 +216,49 @@ C:\Users\ASUS\miniconda3\envs\waterenv\python.exe tests\final_shot.py
 
 ---
 
-## 8. 已知限制
+## 8. 模型与去噪 (M0 已完成)
+
+M0 只做一件事：**把 ATL03 自带的 `signal_conf_ph`（NASA 官方信号识别）当作"已训练好的基线"接进来**，
+作为后续自定义模型的对照与基础设施。
+
+* 剖面参数行新增 **参考模型** 下拉框（`ATL03 高置信 (≥4)` / `中等及以上 (≥3)` /
+  `高置信·陆地 / 海洋 / 内陆水体` / `无`），默认开启；
+* 参考判定为**非信号**的光子淡化为灰色（图例"非信号 (淡化)"），标题给出
+  `参考 高置信 (≥4): 130,277/182,714 (71.3%)`；选"无"即恢复普通显示；
+* 读取器把 `signal_conf_ph`(N×5) 与 `quality_ph` 一并带进 `PhotonSelection.extras`，
+  后续模型与指标都从同一处取参考标签（不改变原有筛选逻辑，也无额外读取开销）。
+
+代码位置 `icesat_viewer/ml/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `base.py` | `PhotonFrame`（一帧光子）、`PhotonModel` 协议（只需实现 `predict(frame) -> score`）、`apply_model()`（统一阈值/校验：NaN、越界裁剪，长度不符抛 `ModelContractError`） |
+| `reference.py` | `SignalConfidenceModel`：官方参考模型，`score = signal_conf/4`，可选通道与阈值 |
+| `metrics.py` | `evaluate()` → 混淆矩阵、P/R/F1/保留率；`surface_residual_rmse()` 表面残差 |
+
+测试 `tests/test_ml.py`（12 项），其中最关键的一致性交叉验证：
+
+```
+[ML] 全部 1,652 光子, 参考高置信 829, 仅高置信筛选 829
+```
+
+即"参考模型判定为高置信的光子数"与"用 `conf_mode=仅高置信` 筛选出的光子数"完全一致，
+证明 `signal_conf` 已正确贯通到 `extras` 且参考模型口径与读取器一致。
+
+> 后续 M1：内置基线（分位数带 / 网格连通域 / YAPC 移植 / BDT-ADBSCAN 移植）与自定义模型适配器
+> （sklearn / XGBoost / LightGBM / ONNX / 用户脚本），全部走同一个 `PhotonModel` 接口。
+
+---
+
+## 9. 已知限制
 
 * ATL03 单次剖面默认最多读取 400 万光子，超出会随机抽稀并在剖面标题中标注；CSV 导出为抽稀后的结果。
 * 多个数据文件同时显示时，剖面会把各文件的廊道光子合并绘制（按波束/产品着色）。
 * 底图注记层（cva_w/cia_w/cta_w）仅在配置了天地图密钥时可用。
+* M0 参考模型需要数据自带 `signal_conf_ph`（ATL03/ATL08 有；CSV/LAS 没有时会提示不可评估）。
+
+---
+
+## 10. 许可证
+
+[MIT](LICENSE)

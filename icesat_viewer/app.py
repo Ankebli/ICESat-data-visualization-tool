@@ -38,6 +38,8 @@ from .icesat_io import (BEAM_NAMES, BEAM_ORDER, CONF_CHANNELS, CONF_MODES,
                         merge_selections, open_dataset)
 from .demo_data import generate_demo_atl03
 from .mapview import MapCanvas
+from .ml import (REFERENCE_CHOICES, REFERENCE_NONE, model_from_selection,
+                 reference_model_for)
 from .profileview import ProfileCanvas
 from .settings import INDEX_CACHE_DIR, TILE_CACHE_DIR, Settings
 
@@ -393,6 +395,16 @@ class IcesatViewerApp(tk.Tk):
         ttk.Spinbox(bar, from_=1, to=500, increment=5, width=5, textvariable=self.bin_var,
                     command=self._refresh_profile_display).pack(side="left")
         ttk.Label(bar, text="m").pack(side="left")
+
+        # ---- M0: 参考模型 (ATL03 自带 signal_conf 作为官方基线) ----
+        ttk.Label(bar, text="参考模型").pack(side="left", padx=(10, 0))
+        self.reference_var = tk.StringVar(
+            value=str(self.settings["reference_model"] or REFERENCE_NONE))
+        cb_ref = ttk.Combobox(bar, textvariable=self.reference_var,
+                              values=[REFERENCE_NONE] + list(REFERENCE_CHOICES),
+                              state="readonly", width=20)
+        cb_ref.pack(side="left", padx=(2, 6))
+        cb_ref.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
 
         ttk.Button(bar, text="导出 CSV", command=self.export_profile_csv).pack(side="right",
                                                                            padx=(3, 2))
@@ -907,17 +919,59 @@ class IcesatViewerApp(tk.Tk):
         selection = selection if selection is not None else self.profile.selection
         if selection is None:
             return
+        highlight, note = self._reference_overlay(selection)
         self.profile.set_selection(
             selection, elev_kind=self.elev_var.get(),
             point_size=float(self.point_size_var.get()),
             show_surface=bool(self.surface_var.get()),
             bin_size_m=float(self.bin_var.get()),
             hist_bins=int(self.settings["hist_bins"]),
-            show_histogram=bool(self.show_hist_var.get()))
+            show_histogram=bool(self.show_hist_var.get()),
+            highlight_mask=highlight, note=note)
         self.settings.update({"elev_kind": self.elev_var.get(),
                               "point_size": float(self.point_size_var.get()),
                               "show_surface": bool(self.surface_var.get()),
-                              "bin_size_m": float(self.bin_var.get())})
+                              "bin_size_m": float(self.bin_var.get()),
+                              "reference_model": self.reference_var.get()})
+
+    # ------------------------------------------------------------------
+    # M0: 官方参考模型 (ATL03 signal_conf) —— 作为"已训练好的基线"
+    # ------------------------------------------------------------------
+    def _reference_overlay(self, selection: Optional[PhotonSelection]
+                           ) -> tuple:
+        """计算参考模型的信号掩膜与说明文字.
+
+        返回 ``(highlight_mask, note)``; 参考模型被关闭或产品缺少 ``signal_conf``
+        时返回 ``(None, "")`` / ``(None, 说明)``, 剖面保持原样。
+        """
+        self.last_reference = {}
+        if selection is None or len(selection) == 0:
+            return None, ""
+        choice = self.reference_var.get()
+        model = reference_model_for(choice)
+        if model is None:
+            return None, ""
+        try:
+            frame = model_from_selection(selection, self.elev_var.get())
+            result = model.result(frame)
+        except Exception as exc:                      # 模型异常不影响主流程
+            self._status(f"参考模型计算失败 — {type(exc).__name__}: {exc}", error=True)
+            return None, ""
+        if result is None:
+            note = "该数据无 ATL03 signal_conf, 参考模型不可用"
+            self.last_reference = {"choice": choice, "available": False}
+            return None, note
+        mask = np.asarray(result.label, dtype=bool)
+        n_sig = int(mask.sum())
+        total = max(len(selection), 1)
+        ratio = 100.0 * n_sig / total
+        note = (f"参考 {choice.replace('ATL03 ', '')}: {n_sig:,}/{total:,} ({ratio:.1f}%)")
+        self.last_reference = {
+            "choice": choice, "available": True, "n_signal": n_sig,
+            "n_total": int(len(selection)), "ratio": ratio,
+            "channel": result.meta.get("channel"), "min_conf": result.meta.get("min_conf"),
+        }
+        return mask, note
 
     def clear_pick(self) -> None:
         self.map.clear_pick()
@@ -1420,6 +1474,10 @@ HELP_TEXT = """ICESat 光子剖面查看器 — 使用说明
     • 剔除噪声标记: 剔除 ATL03 quality_ph ≠ 0 的光子 (afterpulse / 脉冲响应等)。
     • 高程基准    : 椭球高 (WGS84) / 正交高 (减 geophys_corr/geoid) / 相对高 (减中值)。
     • 面元中值    : 按沿迹分箱 (默认 20 m) 的中值曲线与 10~90% 分位带, 便于看清水面/地表起伏。
+    • 参考模型    : 用 ATL03 产品自带的 signal_conf_ph (NASA 官方信号识别) 作为"已训练好的
+      基线": 参考判定为非信号的光子会**淡化成灰色**, 标题显示"参考信号数/总数(占比)"。
+      口径可选 高置信(≥4) / 中等及以上(≥3) / 指定通道(陆地·海洋·内陆水体) 等;
+      选"无 (不评估)"则恢复普通显示。CSV/LAS 等无 signal_conf 的产品会自动提示不可用。
 
 五、地图操作
     中键拖动   : 平移底图
