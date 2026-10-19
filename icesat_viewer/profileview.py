@@ -41,8 +41,9 @@ class ProfileCanvas(ttk.Frame):
         self._marker_artists: list = []
         self._plot_along: Optional[np.ndarray] = None
         self._plot_elev: Optional[np.ndarray] = None
-        #: M0: 参考模型高亮 (True=信号) 与标题注释
+        #: M0: 参考模型高亮 (True=信号) 与显示方式/标题注释
         self._highlight_mask: Optional[np.ndarray] = None
+        self._ref_mode: str = "highlight"
         self._note: str = ""
 
         self.figure = Figure(figsize=(7.2, 2.9), dpi=dpi, facecolor="#fbfbfc")
@@ -169,18 +170,25 @@ class ProfileCanvas(ttk.Frame):
                       show_surface: bool = True, bin_size_m: float = 20.0,
                       hist_bins: int = 200, show_histogram: bool = True,
                       highlight_mask: Optional[np.ndarray] = None,
-                      note: str = "", fade_alpha: float = 0.18):
+                      ref_mode: str = "highlight", note: str = "",
+                      fade_alpha: float = 0.22):
         """绘制剖面.
 
-        ``highlight_mask`` (每光子一个布尔值): 给定时 True 用波束颜色正常绘制,
-        False 淡化为灰色 —— 用于展示"参考模型/去噪模型判定为非信号"的光子;
-        ``note`` 追加到标题中 (例如参考信号占比);
-        直方图此时只统计 highlight 部分, 便于看信号的高程分布。
+        ``highlight_mask`` (每光子一个布尔值): 模型/参考判定为"信号"的位置;
+        ``ref_mode``:
+
+        * ``"highlight"``: 非信号淡化为灰色 (默认)
+        * ``"only"``:      只绘制信号光子
+        * ``"all"``:       不区分, 全部按波束颜色绘制
+
+        ``note`` 追加到标题 (例如参考信号占比); 直方图在 highlight/only 模式下
+        只统计信号, 便于看高程分布。
         """
         self.selection = selection
         self.elev_kind = elev_kind
         self._highlight_mask = (None if highlight_mask is None
                                 else np.asarray(highlight_mask, dtype=bool))
+        self._ref_mode = ref_mode if ref_mode in ("highlight", "only", "all") else "highlight"
         self._note = note
         if selection is None or len(selection) == 0:
             self._empty("该直线范围内未找到 ICESat 光子\n"
@@ -218,9 +226,11 @@ class ProfileCanvas(ttk.Frame):
         self.ax.grid(True, color="#e2e4e8", linewidth=0.7)
         self.ax.set_axisbelow(True)
 
-        # ---- 光子散点: 先画淡化的"非信号", 再按波束画正常光子 ----
+        # ---- 光子散点: 按 ref_mode 决定淡化/只画信号 ----
         handles = []
-        if highlight is not None and not np.all(highlight):
+        draw_all = highlight is None or self._ref_mode == "all"
+        only_signal = highlight is not None and self._ref_mode == "only"
+        if highlight is not None and self._ref_mode == "highlight" and not np.all(highlight):
             dim_s = max(float(point_size) * 0.8, 0.6)
             if isinstance(keep, np.ndarray):
                 sub = ~highlight[keep]
@@ -228,13 +238,13 @@ class ProfileCanvas(ttk.Frame):
             else:
                 xs, ys = along_all[~highlight], elev_all[~highlight]
             if xs.size:
-                self.ax.scatter(xs, ys, s=dim_s, c="#b0bec5", alpha=float(fade_alpha),
+                self.ax.scatter(xs, ys, s=dim_s, c="#90a4ae", alpha=float(fade_alpha),
                                 linewidths=0, rasterized=True, zorder=1,
-                                label="非信号 (淡化)")
+                                label=f"非信号 淡化 ({int((~highlight).sum()):,})")
         unique = list(dict.fromkeys(labels.tolist()))
         for i, label in enumerate(unique):
             mask = labels == label
-            if highlight is not None:
+            if not draw_all:
                 mask = mask & highlight
             color = BEAM_COLORS.get(label, FALLBACK_COLORS[i % len(FALLBACK_COLORS)])
             if isinstance(keep, np.ndarray):
@@ -244,21 +254,28 @@ class ProfileCanvas(ttk.Frame):
                 xs, ys = along_all[mask], elev_all[mask]
             if xs.size == 0:
                 continue
-            self.ax.scatter(xs, ys, s=float(point_size), c=color, alpha=0.6,
+            alpha = 0.75 if only_signal else 0.6
+            size = float(point_size) * (1.15 if only_signal else 1.0)
+            self.ax.scatter(xs, ys, s=size, c=color, alpha=alpha,
                             linewidths=0, rasterized=True, zorder=3,
                             label=BEAM_NAMES.get(label, label))
             handles.append(label)
 
+        # 信号子集 (highlight/only 模式下统计与面元线只用它 -> 相当于"去噪后"的结果)
+        use_signal = (highlight is not None and self._ref_mode in ("highlight", "only")
+                      and np.any(highlight))
+        sig_along = along_all[highlight] if use_signal else along_all
+        sig_elev = elev_all[highlight] if use_signal else elev_all
+
         # ---- 面元中值 + 分位带 ----
-        stats_text = ""
         if show_surface:
             bin_m = max(float(bin_size_m), 0.5)
-            centers, med, counts = binned_statistic(along_all, elev_all, bin_m,
+            centers, med, counts = binned_statistic(sig_along, sig_elev, bin_m,
                                                     statistic="median",
                                                     length_m=selection.corridor.length_m)
-            _, p10, _ = binned_statistic(along_all, elev_all, bin_m, statistic="p10",
+            _, p10, _ = binned_statistic(sig_along, sig_elev, bin_m, statistic="p10",
                                          length_m=selection.corridor.length_m)
-            _, p90, _ = binned_statistic(along_all, elev_all, bin_m, statistic="p90",
+            _, p90, _ = binned_statistic(sig_along, sig_elev, bin_m, statistic="p90",
                                          length_m=selection.corridor.length_m)
             ok = np.isfinite(med)
             if np.any(ok):
@@ -269,16 +286,21 @@ class ProfileCanvas(ttk.Frame):
                              zorder=3, label=f"面元中值 ({bin_m:g} m)")
 
         # ---- 统计信息 ----
-        stats = elevation_statistics(elev_all if highlight is None else elev_all[highlight]
-                                     if np.any(highlight) else elev_all)
+        stats = elevation_statistics(sig_elev)
         self.ax.set_xlim(0, max(float(selection.corridor.length_m), 1.0))
-        ymin, ymax = float(np.min(elev_all)), float(np.max(elev_all))
+        if only_signal and sig_elev.size:
+            ymin, ymax = float(np.min(sig_elev)), float(np.max(sig_elev))
+        else:
+            ymin, ymax = float(np.min(elev_all)), float(np.max(elev_all))
         pad = max((ymax - ymin) * 0.06, 1.0)
         self.ax.set_ylim(ymin - pad, ymax + pad)
         self.ax.set_xlabel("沿剖切线距离 (m)", fontsize=9)
         self.ax.set_ylabel(selection.elev_label(elev_kind), fontsize=9)
         self.ax.tick_params(labelsize=8)
-        title = (f"光子数 {elev_all.size:,}    中线长 {selection.corridor.length_m:,.0f} m    "
+        n_show = int(sig_elev.size) if use_signal else int(elev_all.size)
+        count_text = (f"光子数 {elev_all.size:,}" if n_show == elev_all.size
+                      else f"光子数 {elev_all.size:,} → 信号 {n_show:,}")
+        title = (f"{count_text}    中线长 {selection.corridor.length_m:,.0f} m    "
                  f"廊道 ±{selection.corridor.half_width_m:g} m    "
                  f"高程 {stats['min']:.2f}~{stats['max']:.2f} m, 中值 {stats['median']:.2f} m")
         if note:
@@ -288,15 +310,25 @@ class ProfileCanvas(ttk.Frame):
             self.ax.legend(fontsize=7.5, loc="upper right", framealpha=0.85,
                            ncol=1, handletextpad=0.3, borderpad=0.3)
 
-        # ---- 右侧高程直方图 (有 highlight 时只统计信号) ----
-        hist_values = elev_all if highlight is None else elev_all[highlight]
+        # ---- 右侧高程直方图 (参考模式下只统计信号) ----
+        hist_values = sig_elev if use_signal else elev_all
         if show_histogram and hist_values.size:
-            self.axh.hist(hist_values, bins=int(max(hist_bins, 10)),
+            n_bins = int(max(hist_bins, 10))
+            bin_w = (self.ax.get_ylim()[1] - self.ax.get_ylim()[0]) / n_bins
+            self.axh.hist(hist_values, bins=n_bins, range=self.ax.get_ylim(),
                           orientation="horizontal", color="#5c7c8a", alpha=0.75)
-            self.axh.set_xlabel("光子数", fontsize=8)
+            self.axh.set_xlabel(f"光子数 (每 {bin_w:.2f} m)", fontsize=8)
             self.axh.tick_params(labelsize=7)
             self.axh.tick_params(labelleft=False)
             self.axh.set_ylim(self.ax.get_ylim())
+            # 信号集中在一两个分箱时, 直方图看起来"是空的", 这里直接标注范围
+            occupied = int(np.count_nonzero(np.histogram(hist_values, bins=n_bins,
+                                                         range=self.ax.get_ylim())[0]))
+            if occupied <= 3 and hist_values.size:
+                lo, hi = np.nanpercentile(hist_values, [5, 95])
+                self.axh.text(0.5, 0.5, f"信号集中于\n{lo:.2f}~{hi:.2f} m\n(仅占 {occupied} 个分箱)",
+                              transform=self.axh.transAxes, ha="center", va="center",
+                              fontsize=8, color="#e65100")
         else:
             self.axh.set_visible(False)
 

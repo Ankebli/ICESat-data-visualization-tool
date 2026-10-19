@@ -38,8 +38,8 @@ from .icesat_io import (BEAM_NAMES, BEAM_ORDER, CONF_CHANNELS, CONF_MODES,
                         merge_selections, open_dataset)
 from .demo_data import generate_demo_atl03
 from .mapview import MapCanvas
-from .ml import (REFERENCE_CHOICES, REFERENCE_NONE, model_from_selection,
-                 reference_model_for)
+from .ml import (REFERENCE_CHOICES, REFERENCE_NONE, REF_DISPLAY_MODES,
+                 model_from_selection, reference_model_for)
 from .profileview import ProfileCanvas
 from .settings import INDEX_CACHE_DIR, TILE_CACHE_DIR, Settings
 
@@ -352,63 +352,82 @@ class IcesatViewerApp(tk.Tk):
 
     # ------------------------------------------------------------------
     def _build_profile_panel(self, parent: ttk.Frame) -> None:
-        bar = ttk.Frame(parent, padding=(4, 4))
+        """剖面参数栏: 分两行排布, 避免控件被挤出可视区 (窄窗口也完整可见)."""
+        bar = ttk.Frame(parent, padding=(4, 4, 4, 0))
         bar.pack(side="top", fill="x")
-        ttk.Label(bar, text="剖切面", font=("Microsoft YaHei UI", 9, "bold")).pack(side="left",
-                                                                              padx=(2, 8))
-        ttk.Label(bar, text="高程基准").pack(side="left")
+
+        # ---------------- 第一行: 高程 / 筛选 ----------------
+        row1 = ttk.Frame(bar)
+        row1.pack(side="top", fill="x")
+        ttk.Label(row1, text="剖切面", font=("Microsoft YaHei UI", 9, "bold")).pack(
+            side="left", padx=(2, 8))
+        ttk.Label(row1, text="高程基准").pack(side="left")
         self.elev_var = tk.StringVar(value=str(self.settings["elev_kind"]))
-        cb = ttk.Combobox(bar, textvariable=self.elev_var, values=list(ELEV_KINDS),
+        cb = ttk.Combobox(row1, textvariable=self.elev_var, values=list(ELEV_KINDS),
                           state="readonly", width=14)
         cb.pack(side="left", padx=(2, 8))
         cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
 
-        ttk.Label(bar, text="置信度").pack(side="left")
+        ttk.Label(row1, text="置信度").pack(side="left")
         self.conf_var = tk.StringVar(value=str(self.settings["conf_mode"]))
-        cb2 = ttk.Combobox(bar, textvariable=self.conf_var, values=list(CONF_MODES),
+        cb2 = ttk.Combobox(row1, textvariable=self.conf_var, values=list(CONF_MODES),
                            state="readonly", width=11)
         cb2.pack(side="left", padx=(2, 6))
         cb2.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
 
-        ttk.Label(bar, text="通道").pack(side="left")
+        ttk.Label(row1, text="通道").pack(side="left")
         self.channel_var = tk.StringVar(value=str(self.settings["conf_channel"]))
-        cb3 = ttk.Combobox(bar, textvariable=self.channel_var,
+        cb3 = ttk.Combobox(row1, textvariable=self.channel_var,
                            values=["自动"] + list(CONF_CHANNELS), state="readonly", width=9)
         cb3.pack(side="left", padx=(2, 6))
         cb3.bind("<<ComboboxSelected>>", lambda e: self._schedule_recompute())
 
         self.afterpulse_var = tk.BooleanVar(value=bool(self.settings["remove_afterpulse"]))
-        ttk.Checkbutton(bar, text="剔除噪声标记", variable=self.afterpulse_var,
+        ttk.Checkbutton(row1, text="剔除噪声标记", variable=self.afterpulse_var,
                         command=self._schedule_recompute).pack(side="left", padx=(2, 8))
 
-        ttk.Label(bar, text="点大小").pack(side="left")
+        ttk.Label(row1, text="点大小").pack(side="left")
         self.point_size_var = tk.DoubleVar(value=float(self.settings["point_size"]))
-        ttk.Spinbox(bar, from_=0.3, to=10, increment=0.5, width=4,
+        ttk.Spinbox(row1, from_=0.3, to=10, increment=0.5, width=4,
                     textvariable=self.point_size_var,
-                    command=self._refresh_profile_display).pack(side="left", padx=(2, 8))
+                    command=self._refresh_profile_display).pack(side="left", padx=(2, 0))
 
+        # ---------------- 第二行: 显示 / 参考模型 / 导出 ----------------
+        row2 = ttk.Frame(bar)
+        row2.pack(side="top", fill="x", pady=(2, 4))
         self.surface_var = tk.BooleanVar(value=bool(self.settings["show_surface"]))
-        ttk.Checkbutton(bar, text="面元中值", variable=self.surface_var,
-                        command=self._refresh_profile_display).pack(side="left")
-        ttk.Label(bar, text="分箱").pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(row2, text="面元中值", variable=self.surface_var,
+                        command=self._refresh_profile_display).pack(side="left", padx=(2, 6))
+        ttk.Label(row2, text="分箱").pack(side="left")
         self.bin_var = tk.DoubleVar(value=float(self.settings["bin_size_m"]))
-        ttk.Spinbox(bar, from_=1, to=500, increment=5, width=5, textvariable=self.bin_var,
-                    command=self._refresh_profile_display).pack(side="left")
-        ttk.Label(bar, text="m").pack(side="left")
+        ttk.Spinbox(row2, from_=1, to=500, increment=5, width=5, textvariable=self.bin_var,
+                    command=self._refresh_profile_display).pack(side="left", padx=(2, 0))
+        ttk.Label(row2, text="m").pack(side="left", padx=(0, 10))
 
         # ---- M0: 参考模型 (ATL03 自带 signal_conf 作为官方基线) ----
-        ttk.Label(bar, text="参考模型").pack(side="left", padx=(10, 0))
+        ttk.Label(row2, text="参考模型", font=("Microsoft YaHei UI", 9, "bold")).pack(
+            side="left")
         self.reference_var = tk.StringVar(
             value=str(self.settings["reference_model"] or REFERENCE_NONE))
-        cb_ref = ttk.Combobox(bar, textvariable=self.reference_var,
+        cb_ref = ttk.Combobox(row2, textvariable=self.reference_var,
                               values=[REFERENCE_NONE] + list(REFERENCE_CHOICES),
-                              state="readonly", width=20)
+                              state="readonly", width=22)
         cb_ref.pack(side="left", padx=(2, 6))
         cb_ref.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
+        self.reference_combo = cb_ref          # 供界面回归测试检查可见性
 
-        ttk.Button(bar, text="导出 CSV", command=self.export_profile_csv).pack(side="right",
-                                                                           padx=(3, 2))
-        ttk.Button(bar, text="保存剖面图", command=self.export_profile_png).pack(side="right")
+        ttk.Label(row2, text="显示").pack(side="left")
+        self.ref_mode_var = tk.StringVar(
+            value=str(self.settings["reference_display"] or "高亮参考信号"))
+        cb_mode = ttk.Combobox(row2, textvariable=self.ref_mode_var,
+                               values=list(REF_DISPLAY_MODES), state="readonly", width=12)
+        cb_mode.pack(side="left", padx=(2, 6))
+        cb_mode.bind("<<ComboboxSelected>>", lambda e: self._refresh_profile_display())
+        self.ref_mode_combo = cb_mode
+
+        ttk.Button(row2, text="保存剖面图", command=self.export_profile_png).pack(
+            side="right", padx=(3, 2))
+        ttk.Button(row2, text="导出 CSV", command=self.export_profile_csv).pack(side="right")
 
         self.profile = ProfileCanvas(parent, dpi=self.dpi, on_status=self._on_map_status,
                                      on_locate=self._on_profile_locate)
@@ -920,6 +939,7 @@ class IcesatViewerApp(tk.Tk):
         if selection is None:
             return
         highlight, note = self._reference_overlay(selection)
+        mode = REF_DISPLAY_MODES.get(self.ref_mode_var.get(), "highlight")
         self.profile.set_selection(
             selection, elev_kind=self.elev_var.get(),
             point_size=float(self.point_size_var.get()),
@@ -927,12 +947,15 @@ class IcesatViewerApp(tk.Tk):
             bin_size_m=float(self.bin_var.get()),
             hist_bins=int(self.settings["hist_bins"]),
             show_histogram=bool(self.show_hist_var.get()),
-            highlight_mask=highlight, note=note)
+            highlight_mask=highlight, ref_mode=mode, note=note)
+        if note:
+            self._status(f"{note}  —  " + self.status_var.get()[:130])
         self.settings.update({"elev_kind": self.elev_var.get(),
                               "point_size": float(self.point_size_var.get()),
                               "show_surface": bool(self.surface_var.get()),
                               "bin_size_m": float(self.bin_var.get()),
-                              "reference_model": self.reference_var.get()})
+                              "reference_model": self.reference_var.get(),
+                              "reference_display": self.ref_mode_var.get()})
 
     # ------------------------------------------------------------------
     # M0: 官方参考模型 (ATL03 signal_conf) —— 作为"已训练好的基线"
@@ -966,9 +989,14 @@ class IcesatViewerApp(tk.Tk):
         total = max(len(selection), 1)
         ratio = 100.0 * n_sig / total
         note = (f"参考 {choice.replace('ATL03 ', '')}: {n_sig:,}/{total:,} ({ratio:.1f}%)")
+        if n_sig >= total:
+            # 用户当前的置信度筛选已经把所有光子都筛成"信号", 参考模型自然看不出差异
+            note += ("  ⚠ 当前筛选已全部命中参考口径, 参考模型无可淡化 —— "
+                     "把「置信度」改为「全部」即可看到原始噪声被淡化")
         self.last_reference = {
             "choice": choice, "available": True, "n_signal": n_sig,
             "n_total": int(len(selection)), "ratio": ratio,
+            "all_signal": bool(n_sig >= total),
             "channel": result.meta.get("channel"), "min_conf": result.meta.get("min_conf"),
         }
         return mask, note

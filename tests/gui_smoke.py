@@ -415,6 +415,31 @@ def main() -> int:
     pump(app, 0.5)
     print("      关闭/重开参考模型均正常 (无模态框打扰)")
 
+    # 布局回归: 新加的控件曾被挤出可视区 (x=0,w=1), 这里强制检查
+    row2 = app.reference_combo.master
+    combo_right = app.reference_combo.winfo_x() + app.reference_combo.winfo_width()
+    mode_right = app.ref_mode_combo.winfo_x() + app.ref_mode_combo.winfo_width()
+    row_w = row2.winfo_width()
+    print(f"[18.1] 布局: 参考模型下拉框右端 {combo_right}, 显示模式右端 {mode_right}, "
+          f"该行宽 {row_w}")
+    if min(app.reference_combo.winfo_width(), app.ref_mode_combo.winfo_width()) <= 10:
+        print("!! 参考模型/显示模式下拉框被挤出可视区")
+        return 1
+    if combo_right > row_w or mode_right > row_w:
+        print("!! 剖面参数栏控件超出可视宽度")
+        return 1
+
+    # 三种显示方式都要能切换
+    for mode_name in ("仅参考信号", "全部光子", "高亮参考信号"):
+        app.ref_mode_var.set(mode_name)
+        app._refresh_profile_display()
+        pump(app, 0.4)
+        expect = {"仅参考信号": "only", "全部光子": "all", "高亮参考信号": "highlight"}[mode_name]
+        if app.profile._ref_mode != expect:
+            print(f"!! 显示方式切换失败: {mode_name} -> {app.profile._ref_mode}")
+            return 1
+    print("      显示方式切换 (仅信号/全部/高亮) 正常")
+
     # ---------- 天地图底图 + 密钥 ----------
     from icesat_viewer import app as app_module
 

@@ -33,6 +33,13 @@ REFERENCE_CHOICES: Dict[str, tuple] = {
     "ATL03 高置信·内陆水体": ("内陆水体", 4),
 }
 
+#: 参考模型的显示方式 (界面下拉框)
+REF_DISPLAY_MODES: Dict[str, str] = {
+    "高亮参考信号": "highlight",   # 非信号淡化 (默认)
+    "仅参考信号": "only",          # 只画信号
+    "全部光子": "all",             # 不区分, 原样绘制
+}
+
 
 class SignalConfidenceModel:
     """把 ATL03 ``signal_conf_ph`` 包装成模型 (score = conf/4)."""

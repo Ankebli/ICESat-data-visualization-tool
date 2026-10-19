@@ -19,6 +19,7 @@ from __future__ import annotations
 from .base import PhotonFrame, PhotonModelResult, apply_model, model_from_selection
 from .metrics import ModelMetrics, evaluate
 from .reference import (
+    REF_DISPLAY_MODES,
     REFERENCE_CHOICES,
     REFERENCE_NONE,
     SignalConfidenceModel,
@@ -29,4 +30,5 @@ __all__ = [
     "PhotonFrame", "PhotonModelResult", "apply_model", "model_from_selection",
     "ModelMetrics", "evaluate",
     "SignalConfidenceModel", "reference_model_for", "REFERENCE_CHOICES", "REFERENCE_NONE",
+    "REF_DISPLAY_MODES",
 ]
