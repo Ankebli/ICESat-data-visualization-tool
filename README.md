@@ -18,7 +18,7 @@
 
 | 全部光子 | 高亮参考信号 | 仅参考信号 |
 | --- | --- | --- |
-| ![](docs/compare_plain_placeholder) | ![](docs/reference_highlight.png) | ![](docs/reference_only.png) |
+| ![](docs/reference_plain.png) | ![](docs/reference_highlight.png) | ![](docs/reference_only.png) |
 
 ---
 
